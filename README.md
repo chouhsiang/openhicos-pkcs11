@@ -65,15 +65,16 @@ pkcs11-tool --module ./ref/libHicos_p11v1.dylib -O --type cert
 | Certificates | 從共用 EF `08F2` 依 index/length 切片讀出，openssl 可完整解析 |
 | Public keys | READ RECORD + 32-bit word 反序還原模數 |
 | Data objects | DODF，含 application / OID |
-| Login | T7S 安全 VERIFY PIN（3DES CBC + MAC），實卡驗證 |
+| Login | Direct HiCOS T7S 使用 3DES CBC + MAC；GPKI ID v1 T7S 使用 GlobalPlatform SCP03（AES-CMAC），兩種皆通過實卡驗證 |
 | Sign | HiCOS V3 `EA` / `C1` RSA；RSA-PKCS / SHA1 / SHA256 均與官方逐位元組一致 |
 | Decrypt | MSE + PSO Decipher；`CKM_RSA_PKCS` |
 
 ## Limits
 
 - Decrypt 尚未在實卡端到端驗證
-- 只取樣過 T7S（`CHT V32N`）+ 2048-bit 金鑰；其他 HiCOS 世代未驗
-- T7S 登入／簽章流程不應直接套用到其他 HiCOS 世代
+- 只取樣過 Direct HiCOS T7S（`CHT V32N`）與 GPKI ID v1 T7S（ATR 尾碼 `CHTGPKIJ`），皆為 2048-bit 金鑰；其他 HiCOS 世代未驗
+- GPKI ID v1 會選取 `A0000002830000062201696400010101` applet，以 SCP03 建立安全通道，再用 PIN reference `01` 驗證 6 至 8 位數 PIN
+- 各世代的登入／簽章流程可能不同，不應直接套用
 
 ## Layout
 
