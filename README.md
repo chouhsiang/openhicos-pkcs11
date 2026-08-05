@@ -151,6 +151,32 @@ make
 #   build/openhicos-pkcs11-linux-x86_64.so
 ```
 
+### macOS universal（給 x86_64 程式用）
+
+官方 `libHicos_p11v1.dylib` 是 **universal（x86_64 + arm64）**。  
+部分舊版工具本身是 **x86_64 only**，在 Apple Silicon 上透過 Rosetta 執行，因此只能載入含 x86_64 slice 的模組；單純的 `…-macos-arm64.so` 會 `dlopen` 失敗。
+
+需先安裝 x86_64 target，再合併：
+
+```bash
+rustup target add x86_64-apple-darwin
+
+cargo build --release
+cargo build --release --target x86_64-apple-darwin
+
+lipo -create \
+  target/release/libopenhicos_pkcs11.dylib \
+  target/x86_64-apple-darwin/release/libopenhicos_pkcs11.dylib \
+  -output build/openhicos-pkcs11-macos-universal.dylib
+```
+
+若工具固定載入檔名 `libHicos_p11v1.dylib`，把 universal 產物改名／複製到該工具同目錄即可。
+
+| 模組架構 | Rosetta（x86_64）程式 | 原生 arm64 程式 |
+|----------|:---------------------:|:---------------:|
+| arm64 only | ✗ | ✓ |
+| universal（x86_64 + arm64） | ✓ | ✓ |
+
 下文假設：
 
 ```bash
@@ -327,6 +353,7 @@ openhicos/
     pkcs11/             # Cryptoki 實作
   ref/                  # 官方模組與 APDU 筆記（對照用，勿散佈）
   build/                # openhicos-pkcs11-<os>-<arch>.so
+                        # 以及 macos-universal.dylib（給 x86_64 工具）
   AGENTS.md
 ```
 
