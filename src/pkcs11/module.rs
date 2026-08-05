@@ -1947,6 +1947,10 @@ fn do_sign(
     CKR_OK
 }
 
+fn sign_operation_stays_active(rv: CK_RV, output_is_null: bool) -> bool {
+    rv == CKR_BUFFER_TOO_SMALL || (rv == CKR_OK && output_is_null)
+}
+
 pub unsafe extern "C" fn c_sign(
     h: CK_SESSION_HANDLE,
     p_data: *mut CK_BYTE,
@@ -1966,7 +1970,7 @@ pub unsafe extern "C" fn c_sign(
         }
         let data = std::slice::from_raw_parts(p_data, ul_data_len as usize);
         let rv = do_sign(state, h, data, p_sig, pul_sig_len);
-        if !p_sig.is_null() || rv != CKR_OK {
+        if !sign_operation_stays_active(rv, p_sig.is_null()) {
             session_get_mut(state, h).unwrap().sign_active = false;
         }
         rv
@@ -2008,7 +2012,7 @@ pub unsafe extern "C" fn c_sign_final(
         }
         let buf = sess.sign_buf.clone();
         let rv = do_sign(state, h, &buf, p_sig, pul_sig_len);
-        if !p_sig.is_null() || rv != CKR_OK {
+        if !sign_operation_stays_active(rv, p_sig.is_null()) {
             session_get_mut(state, h).unwrap().sign_active = false;
         }
         rv
@@ -2451,6 +2455,15 @@ mod tests {
         assert_eq!(&em[em.len() - msg.len()..], msg);
         assert_eq!(em[em.len() - msg.len() - 1], 0x00);
         assert!(em[2..em.len() - msg.len() - 1].iter().all(|&b| b != 0));
+    }
+
+    #[test]
+    fn sign_operation_survives_size_queries_and_small_buffers() {
+        assert!(sign_operation_stays_active(CKR_OK, true));
+        assert!(sign_operation_stays_active(CKR_BUFFER_TOO_SMALL, false));
+        assert!(!sign_operation_stays_active(CKR_OK, false));
+        assert!(!sign_operation_stays_active(CKR_FUNCTION_FAILED, true));
+        assert!(!sign_operation_stays_active(CKR_FUNCTION_FAILED, false));
     }
 }
 
