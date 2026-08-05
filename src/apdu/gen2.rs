@@ -464,6 +464,60 @@ fn pkcs1_v15_signature_block(data: &[u8]) -> Result<[u8; RSA_BLOCK_LEN], ()> {
     Ok(block)
 }
 
+/// Strip PKCS#1 v1.5 encryption padding (`00 02 | PS | 00 | M`).
+fn pkcs1_v15_unpad_type2(block: &[u8]) -> Result<&[u8], ()> {
+    if block.len() != RSA_BLOCK_LEN || block[0] != 0x00 || block[1] != 0x02 {
+        return Err(());
+    }
+    let mut i = 2usize;
+    while i < block.len() && block[i] != 0x00 {
+        i += 1;
+    }
+    // PS must be at least 8 bytes (indices 2..i).
+    if i < 10 || i >= block.len() {
+        return Err(());
+    }
+    Ok(&block[i + 1..])
+}
+
+/// Raw RSA private op under SCP03: `84 EA` / `84 C1` (same path as sign).
+fn rsa_private(
+    pcsc: &mut PcscConn,
+    key_ref: u8,
+    input: &[u8; RSA_BLOCK_LEN],
+    out: &mut [u8; RSA_BLOCK_LEN],
+) -> Result<(), ()> {
+    prepare_for_private_op(pcsc)?;
+
+    let mut result = Vec::with_capacity(RSA_BLOCK_LEN);
+    let chunks: Vec<&[u8]> = input.chunks_exact(RSA_CHUNK_LEN).collect();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let more = index + 1 < chunks.len();
+        let p1 = if more { 0x82 } else { 0x02 };
+        let le = if more { None } else { Some(0x80) };
+        let (sw, resp) = transmit_sm(pcsc, 0x80, 0xEA, p1, key_ref, chunk, le, true)?;
+        if sw != 0x9000 {
+            return Err(());
+        }
+        result.extend_from_slice(&resp);
+    }
+
+    while result.len() < RSA_BLOCK_LEN {
+        // Case-2 APDU `80 C1 00 80` + Le, MAC-only (no C-ENC on empty body).
+        let (sw, resp) = transmit_sm(pcsc, 0x80, 0xC1, 0x00, 0x80, &[], Some(0x80), false)?;
+        if sw != 0x9000 || resp.is_empty() {
+            return Err(());
+        }
+        result.extend_from_slice(&resp);
+        if result.len() > RSA_BLOCK_LEN {
+            return Err(());
+        }
+    }
+
+    out.copy_from_slice(&result[..RSA_BLOCK_LEN]);
+    Ok(())
+}
+
 /// Gen2 RSA sign: re-auth under SCP03, SM-SELECT key DF, then `84 EA` / `84 C1`.
 pub fn sign(
     pcsc: &mut PcscConn,
@@ -474,41 +528,54 @@ pub fn sign(
     if out.len() < RSA_BLOCK_LEN {
         return Err(());
     }
-    prepare_for_private_op(pcsc)?;
     let block = pkcs1_v15_signature_block(data)?;
-
-    let mut signature = Vec::with_capacity(RSA_BLOCK_LEN);
-    let chunks: Vec<&[u8]> = block.chunks_exact(RSA_CHUNK_LEN).collect();
-    for (index, chunk) in chunks.iter().enumerate() {
-        let more = index + 1 < chunks.len();
-        let p1 = if more { 0x82 } else { 0x02 };
-        let le = if more { None } else { Some(0x80) };
-        let (sw, resp) = transmit_sm(pcsc, 0x80, 0xEA, p1, key_ref, chunk, le, true)?;
-        if sw != 0x9000 {
-            return Err(());
-        }
-        signature.extend_from_slice(&resp);
-    }
-
-    while signature.len() < RSA_BLOCK_LEN {
-        // Case-2 APDU `80 C1 00 80` + Le, MAC-only (no C-ENC on empty body).
-        let (sw, resp) = transmit_sm(pcsc, 0x80, 0xC1, 0x00, 0x80, &[], Some(0x80), false)?;
-        if sw != 0x9000 || resp.is_empty() {
-            return Err(());
-        }
-        signature.extend_from_slice(&resp);
-        if signature.len() > RSA_BLOCK_LEN {
-            return Err(());
-        }
-    }
-
-    out[..RSA_BLOCK_LEN].copy_from_slice(&signature[..RSA_BLOCK_LEN]);
+    let mut signature = [0u8; RSA_BLOCK_LEN];
+    rsa_private(pcsc, key_ref, &block, &mut signature)?;
+    out[..RSA_BLOCK_LEN].copy_from_slice(&signature);
     Ok(RSA_BLOCK_LEN)
+}
+
+/// Gen2 RSA decrypt (CKM_RSA_PKCS): same `84 EA`/`84 C1` as sign, then type-2 unpad.
+pub fn decrypt(
+    pcsc: &mut PcscConn,
+    key_ref: u8,
+    cipher: &[u8],
+    out: &mut [u8],
+) -> Result<usize, ()> {
+    if cipher.len() != RSA_BLOCK_LEN {
+        return Err(());
+    }
+    let mut input = [0u8; RSA_BLOCK_LEN];
+    input.copy_from_slice(cipher);
+    let mut block = [0u8; RSA_BLOCK_LEN];
+    rsa_private(pcsc, key_ref, &input, &mut block)?;
+    let msg = pkcs1_v15_unpad_type2(&block)?;
+    if msg.len() > out.len() {
+        return Err(());
+    }
+    out[..msg.len()].copy_from_slice(msg);
+    Ok(msg.len())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pkcs1_type2_unpad_extracts_message() {
+        let mut block = [0xAAu8; RSA_BLOCK_LEN];
+        block[0] = 0x00;
+        block[1] = 0x02;
+        // PS = bytes 2..13 (11 bytes), separator at 13, message follows
+        for b in &mut block[2..13] {
+            *b = 0xAA;
+        }
+        block[13] = 0x00;
+        block[14..].fill(0);
+        let msg = b"openhicos-decrypt-test";
+        block[14..14 + msg.len()].copy_from_slice(msg);
+        assert_eq!(pkcs1_v15_unpad_type2(&block).unwrap(), msg);
+    }
 
     #[test]
     fn diverse_matches_known_card_keys() {

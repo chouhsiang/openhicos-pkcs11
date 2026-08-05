@@ -119,8 +119,62 @@ fn pkcs1_v15_signature_block(data: &[u8]) -> Result<[u8; RSA_BLOCK_LEN], ()> {
     Ok(block)
 }
 
+/// Strip PKCS#1 v1.5 encryption padding (`00 02 | PS | 00 | M`).
+fn pkcs1_v15_unpad_type2(block: &[u8]) -> Result<&[u8], ()> {
+    if block.len() != RSA_BLOCK_LEN || block[0] != 0x00 || block[1] != 0x02 {
+        return Err(());
+    }
+    let mut i = 2usize;
+    while i < block.len() && block[i] != 0x00 {
+        i += 1;
+    }
+    if i < 10 || i >= block.len() {
+        return Err(());
+    }
+    Ok(&block[i + 1..])
+}
+
 /// Proprietary gen1 RSA private operation: two 128-byte `EA` transfers then
 /// one `C1` continuation read.
+fn rsa_private(
+    pcsc: &mut PcscConn,
+    key_ref: u8,
+    input: &[u8; RSA_BLOCK_LEN],
+    out: &mut [u8; RSA_BLOCK_LEN],
+) -> Result<(), ()> {
+    select_key_ef(pcsc)?;
+
+    let mut result = Vec::with_capacity(RSA_BLOCK_LEN);
+    for (index, chunk) in input.chunks_exact(RSA_CHUNK_LEN).enumerate() {
+        let p1 = if index == 0 { 0x82 } else { 0x02 };
+        let mut cmd = vec![0x80, 0xEA, p1, key_ref, RSA_CHUNK_LEN as u8];
+        cmd.extend_from_slice(chunk);
+        let mut resp = Vec::new();
+        if pcsc.transmit(&cmd, &mut resp).map_err(|_| ())? != 0x9000 {
+            return Err(());
+        }
+        result.extend_from_slice(&resp);
+    }
+    while result.len() < RSA_BLOCK_LEN {
+        let offset = result.len();
+        let want = RSA_CHUNK_LEN.min(RSA_BLOCK_LEN - offset);
+        let cmd = [0x80, 0xC1, (offset >> 8) as u8, offset as u8, want as u8];
+        let mut resp = Vec::new();
+        if pcsc.transmit(&cmd, &mut resp).map_err(|_| ())? != 0x9000
+            || resp.is_empty()
+            || resp.len() > want
+        {
+            return Err(());
+        }
+        result.extend_from_slice(&resp);
+    }
+    if result.len() != RSA_BLOCK_LEN {
+        return Err(());
+    }
+    out.copy_from_slice(&result);
+    Ok(())
+}
+
 pub fn sign(
     pcsc: &mut PcscConn,
     key_ref: u8,
@@ -131,37 +185,32 @@ pub fn sign(
         return Err(());
     }
     let block = pkcs1_v15_signature_block(data)?;
-    select_key_ef(pcsc)?;
-
-    let mut signature = Vec::with_capacity(RSA_BLOCK_LEN);
-    for (index, chunk) in block.chunks_exact(RSA_CHUNK_LEN).enumerate() {
-        let p1 = if index == 0 { 0x82 } else { 0x02 };
-        let mut cmd = vec![0x80, 0xEA, p1, key_ref, RSA_CHUNK_LEN as u8];
-        cmd.extend_from_slice(chunk);
-        let mut resp = Vec::new();
-        if pcsc.transmit(&cmd, &mut resp).map_err(|_| ())? != 0x9000 {
-            return Err(());
-        }
-        signature.extend_from_slice(&resp);
-    }
-    while signature.len() < RSA_BLOCK_LEN {
-        let offset = signature.len();
-        let want = RSA_CHUNK_LEN.min(RSA_BLOCK_LEN - offset);
-        let cmd = [0x80, 0xC1, (offset >> 8) as u8, offset as u8, want as u8];
-        let mut resp = Vec::new();
-        if pcsc.transmit(&cmd, &mut resp).map_err(|_| ())? != 0x9000
-            || resp.is_empty()
-            || resp.len() > want
-        {
-            return Err(());
-        }
-        signature.extend_from_slice(&resp);
-    }
-    if signature.len() != RSA_BLOCK_LEN {
-        return Err(());
-    }
+    let mut signature = [0u8; RSA_BLOCK_LEN];
+    rsa_private(pcsc, key_ref, &block, &mut signature)?;
     out[..RSA_BLOCK_LEN].copy_from_slice(&signature);
     Ok(RSA_BLOCK_LEN)
+}
+
+/// Gen1 RSA decrypt (CKM_RSA_PKCS): same `80 EA`/`80 C1` as sign, then type-2 unpad.
+pub fn decrypt(
+    pcsc: &mut PcscConn,
+    key_ref: u8,
+    cipher: &[u8],
+    out: &mut [u8],
+) -> Result<usize, ()> {
+    if cipher.len() != RSA_BLOCK_LEN {
+        return Err(());
+    }
+    let mut input = [0u8; RSA_BLOCK_LEN];
+    input.copy_from_slice(cipher);
+    let mut block = [0u8; RSA_BLOCK_LEN];
+    rsa_private(pcsc, key_ref, &input, &mut block)?;
+    let msg = pkcs1_v15_unpad_type2(&block)?;
+    if msg.len() > out.len() {
+        return Err(());
+    }
+    out[..msg.len()].copy_from_slice(msg);
+    Ok(msg.len())
 }
 
 /// Select key EF then READ RECORD with the active CLA (gen1 style).

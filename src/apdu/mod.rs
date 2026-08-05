@@ -181,6 +181,22 @@ pub fn sign(
     }
 }
 
+/// Dispatch RSA decrypt (`CKM_RSA_PKCS`) to the active card profile.
+///
+/// HiCOS uses the same proprietary `EA`/`C1` private op as sign (not ISO MSE/PSO),
+/// then host-side PKCS#1 v1.5 type-2 unpadding.
+pub fn decrypt(
+    pcsc: &mut PcscConn,
+    key_ref: u8,
+    cipher: &[u8],
+    out: &mut [u8],
+) -> Result<usize, ()> {
+    match profile() {
+        CardProfile::Gen1 => gen1::decrypt(pcsc, key_ref, cipher, out),
+        CardProfile::Gen2 => gen2::decrypt(pcsc, key_ref, cipher, out),
+    }
+}
+
 pub fn read_binary(pcsc: &mut PcscConn, offset: u32, buf: &mut [u8]) -> Result<usize, ()> {
     if buf.is_empty() || buf.len() > 255 || offset > 0x7FFF {
         return Err(());

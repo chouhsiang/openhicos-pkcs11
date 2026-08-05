@@ -32,7 +32,7 @@ Repository: https://github.com/chouhsiang/openhicos-pkcs11
 | 公鑰讀出 | ✅ word-reverse records | ✅ `80 B2 keyRef 03/04` 直讀兩半 |
 | Login | ✅ `8C 20` 3DES | ✅ Diverse + SCP03 + SM VERIFY |
 | Sign | ✅ `80 EA` / `80 C1` | ✅ `84 EA` / `84 C1`（簽前重開 SCP） |
-| Decrypt | 程式碼已有，實卡需再驗 | 同左 |
+| Decrypt | ✅ `80 EA`/`C1` + type-2 unpad（工商 KEYX） | ✅ `84 EA`/`84 C1`（同簽章路徑） |
 
 ### 實卡驗證環境（使用者機器）
 
@@ -66,14 +66,14 @@ APDU 實作分檔：`src/apdu/gen1.rs`、`src/apdu/gen2.rs`。
 **一代（gen1 / HiCOS V3 style）**
 - **CLA 0x00 全拒**（6E00）；必須 **CLA 0x80**
 - EF.DIR 可讀；標準 PKCS#15 FID 在 MF 下 **6A82**；官方從不讀 ODF
-- Login：`8C 20` 3DES；Sign：`80 EA` / `80 C1`
+- Login：`8C 20` 3DES；Sign／Decrypt：`80 EA` / `80 C1`
 
 **二代（gen2 / GPPKI）**
 - 必須先 SELECT GPPKI applet AID；其後 CLA `00` 的 SELECT/READ BINARY
 - PKCS#15 目錄仍在 `5030` 下（`4100`/`4101`/`4104`/…），CDF path 形如 `7FFF503008F2`
 - 公鑰：SELECT `0810`→`0811` 後 `80 B2 <keyRef> 03/04 00`（CLA 仍為 **0x80**），兩段 128-byte 直接串成模數，**不**做 32-bit word 反序；指數固定 65537
 - Login：`Diverse` 自卡片 GET DATA 衍生 ENC/MAC/DEK → SCP03 → `04 20` SM VERIFY
-- Sign 前官方會重開 SCP、再 VERIFY，並 SM SELECT `5030`/`0810`，再 `84 EA`/`84 C1`
+- Sign／Decrypt 前官方會重開 SCP、再 VERIFY，並 SM SELECT `5030`/`0810`，再 `84 EA`/`84 C1`
 - **不要**對 gen2 送 gen1 的 `8C 20`
 
 ### 物件配置（已用 APDU 攔截驗證）
@@ -171,12 +171,10 @@ pkcs11-tool --module ./build/openhicos-pkcs11-macos-arm64.so --login \
 
 ## 待辦（優先序）
 
-1. **實卡 Decrypt** 端到端測試（gen1）
-2. AODF `4108` 的 pin_ref 解析仍待驗（T7S 登入實際固定使用 P2=`01`）
-3. Windows Rust 建置（未驗）
-4. 非 2048-bit 金鑰、其他 HiCOS 世代的 record 配置未取樣
-5. gen2 Diverse 目前僅實作 16-byte master blob 路徑
-
+1. AODF `4108` 的 pin_ref 解析仍待驗（T7S 登入實際固定使用 P2=`01`）
+2. Windows Rust 建置（未驗）
+3. 非 2048-bit 金鑰、其他 HiCOS 世代的 record 配置未取樣
+4. gen2 Diverse 目前僅實作 16-byte master blob 路徑
 ---
 
 ## 設計決策備忘

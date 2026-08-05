@@ -27,6 +27,8 @@ struct Session {
     sign_buf: Vec<u8>,
     decrypt_active: bool,
     decrypt_key: CK_OBJECT_HANDLE,
+    decrypt_buf: Vec<u8>,
+    decrypt_plain: Option<Vec<u8>>,
 }
 
 impl Default for Session {
@@ -46,6 +48,8 @@ impl Default for Session {
             sign_buf: Vec::new(),
             decrypt_active: false,
             decrypt_key: 0,
+            decrypt_buf: Vec::new(),
+            decrypt_plain: None,
         }
     }
 }
@@ -919,8 +923,71 @@ pub unsafe extern "C" fn c_decrypt_init(
         };
         sess.decrypt_active = true;
         sess.decrypt_key = h_key;
+        sess.decrypt_buf.clear();
+        sess.decrypt_plain = None;
         CKR_OK
     })
+}
+
+fn do_decrypt(
+    state: &mut State,
+    h: CK_SESSION_HANDLE,
+    cipher: &[u8],
+    p_data: *mut CK_BYTE,
+    pul_data_len: *mut CK_ULONG,
+) -> CK_RV {
+    let (slot_id, key) = {
+        let sess = session_get(state, h).unwrap();
+        (sess.slot, sess.decrypt_key)
+    };
+    let key_ref = match p15::find(&state.slots[slot_id as usize].token, key) {
+        Some(o) => o.key_ref as u8,
+        None => return CKR_KEY_HANDLE_INVALID,
+    };
+
+    // Size probe without touching the card when we already have plaintext cached
+    // (multipart Final after Update decrypted early), or when p_data is null and
+    // we only need an upper bound for RSA-PKCS.
+    if p_data.is_null() {
+        if let Some(plain) = session_get(state, h).and_then(|s| s.decrypt_plain.as_ref()) {
+            unsafe {
+                *pul_data_len = plain.len() as CK_ULONG;
+            }
+            return CKR_OK;
+        }
+        // RSA-PKCS plaintext is at most modulus-11 bytes; report cipher len as bound.
+        unsafe {
+            *pul_data_len = cipher.len() as CK_ULONG;
+        }
+        return CKR_OK;
+    }
+
+    let plain = if let Some(plain) = session_get_mut(state, h)
+        .and_then(|s| s.decrypt_plain.take())
+    {
+        plain
+    } else {
+        let slot = &mut state.slots[slot_id as usize];
+        let mut out = [0u8; 512];
+        match apdu::decrypt(&mut slot.pcsc, key_ref, cipher, &mut out) {
+            Ok(n) => out[..n].to_vec(),
+            Err(_) => return CKR_FUNCTION_FAILED,
+        }
+    };
+
+    unsafe {
+        if *pul_data_len < plain.len() as CK_ULONG {
+            *pul_data_len = plain.len() as CK_ULONG;
+            // Keep plaintext for a retry with a larger buffer.
+            if let Some(sess) = session_get_mut(state, h) {
+                sess.decrypt_plain = Some(plain);
+            }
+            return CKR_BUFFER_TOO_SMALL;
+        }
+        std::ptr::copy_nonoverlapping(plain.as_ptr(), p_data, plain.len());
+        *pul_data_len = plain.len() as CK_ULONG;
+    }
+    CKR_OK
 }
 
 pub unsafe extern "C" fn c_decrypt(
@@ -940,56 +1007,84 @@ pub unsafe extern "C" fn c_decrypt(
         if pul_data_len.is_null() {
             return CKR_ARGUMENTS_BAD;
         }
-        let slot_id = sess.slot;
-        let key = sess.decrypt_key;
-        let key_ref = p15::find(&state.slots[slot_id as usize].token, key).map(|o| o.key_ref as u8);
-        let Some(key_ref) = key_ref else {
-            return CKR_KEY_HANDLE_INVALID;
-        };
-        let cipher = std::slice::from_raw_parts(p_enc, ul_enc_len as usize);
-        let slot = &mut state.slots[slot_id as usize];
-        if apdu::mse_set_decipher(&mut slot.pcsc, key_ref).is_err() {
-            session_get_mut(state, h).unwrap().decrypt_active = false;
-            return CKR_DEVICE_ERROR;
-        }
-        let mut out = [0u8; 512];
-        let n = match apdu::pso_decipher(&mut slot.pcsc, cipher, &mut out) {
-            Ok(n) => n,
-            Err(_) => {
-                session_get_mut(state, h).unwrap().decrypt_active = false;
-                return CKR_FUNCTION_FAILED;
+        let cipher = unsafe { std::slice::from_raw_parts(p_enc, ul_enc_len as usize) };
+        let rv = do_decrypt(state, h, cipher, p_data, pul_data_len);
+        // Keep operation active on size probe / buffer-too-small so the caller can retry.
+        if !p_data.is_null() && rv != CKR_BUFFER_TOO_SMALL {
+            let sess = session_get_mut(state, h).unwrap();
+            sess.decrypt_active = false;
+            sess.decrypt_buf.clear();
+            if rv != CKR_OK {
+                sess.decrypt_plain = None;
             }
-        };
-        session_get_mut(state, h).unwrap().decrypt_active = false;
-        if p_data.is_null() {
-            *pul_data_len = n as CK_ULONG;
-            return CKR_OK;
         }
-        if *pul_data_len < n as CK_ULONG {
-            return CKR_BUFFER_TOO_SMALL;
-        }
-        std::ptr::copy_nonoverlapping(out.as_ptr(), p_data, n);
-        *pul_data_len = n as CK_ULONG;
-        CKR_OK
+        rv
     })
 }
 
 pub unsafe extern "C" fn c_decrypt_update(
-    _h: CK_SESSION_HANDLE,
-    _a: *mut CK_BYTE,
-    _b: CK_ULONG,
-    _c: *mut CK_BYTE,
-    _d: *mut CK_ULONG,
+    h: CK_SESSION_HANDLE,
+    p_part: *mut CK_BYTE,
+    ul_part_len: CK_ULONG,
+    p_decrypted: *mut CK_BYTE,
+    pul_decrypted_len: *mut CK_ULONG,
 ) -> CK_RV {
-    not_supported!()
+    with_state(|state| {
+        let Some(sess) = session_get_mut(state, h) else {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        };
+        if !sess.decrypt_active {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        }
+        if pul_decrypted_len.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+        let part = unsafe { std::slice::from_raw_parts(p_part, ul_part_len as usize) };
+        if sess.decrypt_buf.len() + part.len() > 512 {
+            return CKR_DATA_LEN_RANGE;
+        }
+        sess.decrypt_buf.extend_from_slice(part);
+        // RSA-PKCS is single-part on the card; emit nothing until Final.
+        if p_decrypted.is_null() {
+            unsafe {
+                *pul_decrypted_len = 0;
+            }
+            return CKR_OK;
+        }
+        unsafe {
+            *pul_decrypted_len = 0;
+        }
+        CKR_OK
+    })
 }
 
 pub unsafe extern "C" fn c_decrypt_final(
-    _h: CK_SESSION_HANDLE,
-    _a: *mut CK_BYTE,
-    _b: *mut CK_ULONG,
+    h: CK_SESSION_HANDLE,
+    p_last: *mut CK_BYTE,
+    pul_last_len: *mut CK_ULONG,
 ) -> CK_RV {
-    not_supported!()
+    with_state(|state| {
+        let Some(sess) = session_get(state, h) else {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        };
+        if !sess.decrypt_active {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        }
+        if pul_last_len.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+        let cipher = sess.decrypt_buf.clone();
+        let rv = do_decrypt(state, h, &cipher, p_last, pul_last_len);
+        if !p_last.is_null() && rv != CKR_BUFFER_TOO_SMALL {
+            let sess = session_get_mut(state, h).unwrap();
+            sess.decrypt_active = false;
+            sess.decrypt_buf.clear();
+            if rv != CKR_OK {
+                sess.decrypt_plain = None;
+            }
+        }
+        rv
+    })
 }
 
 pub unsafe extern "C" fn c_digest_init(_h: CK_SESSION_HANDLE, _m: *mut CK_MECHANISM) -> CK_RV {
