@@ -1,5 +1,7 @@
 # openhicos
 
+Repository: [github.com/chouhsiang/openhicos-pkcs11](https://github.com/chouhsiang/openhicos-pkcs11)
+
 Unofficial PKCS#11 module for Taiwan **HiCOS** smart cards（自然人憑證生態）.
 
 Drop-in style alternative to proprietary `libHicos_p11v1.dylib` for tools that

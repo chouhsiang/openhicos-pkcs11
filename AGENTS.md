@@ -1,5 +1,7 @@
 # openhicos — AI / 開發者交接筆記
 
+Repository: https://github.com/chouhsiang/openhicos-pkcs11
+
 > 給下次啟動的 AI 或新協作者：先讀本檔，再讀 `ref/apdu.md`、`docs/apdu-notes.md`。
 > 最後更新：2026-08-05
 
