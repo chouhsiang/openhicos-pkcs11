@@ -1,0 +1,9 @@
+GNU Lesser General Public License v2.1 or later
+
+See: https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html
+
+Disclaimer: This is an unofficial clean-room style implementation inspired by
+public ISO 7816 / PKCS#15 behavior and independent reverse-engineering notes
+of APDU flows. It is NOT affiliated with, endorsed by, or derived from source
+code of the Ministry of the Interior (Taiwan) or Chunghwa Telecom HiCOS
+proprietary middleware.

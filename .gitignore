@@ -1,0 +1,12 @@
+build/
+target/
+.obj/
+.obj-windows-*/
+*.dll.a
+.DS_Store
+Cargo.lock
+
+# 官方參考 dylib（體積大、有授權限制）
+ref/*.dylib
+ref/*.dll
+Makefile.legacy.bak
