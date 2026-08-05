@@ -10,6 +10,9 @@ crate-type = ["cdylib"]
 name = "openhicos_pkcs11"
 
 [dependencies]
+aes = "0.8"
+cipher = "0.4"
+cmac = "0.7"
 des = "0.9.0"
 getrandom = "0.4.3"
 pcsc = "2.8"

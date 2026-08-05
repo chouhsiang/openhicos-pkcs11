@@ -605,6 +605,7 @@ pub unsafe extern "C" fn c_logout(h: CK_SESSION_HANDLE) -> CK_RV {
         } else {
             CKS_RO_PUBLIC_SESSION
         };
+        apdu::clear_auth_state();
         CKR_OK
     })
 }
@@ -1112,7 +1113,7 @@ fn do_sign(
     }
     let slot = &mut state.slots[slot_id as usize];
     let mut out = [0u8; 512];
-    let n = match apdu::hicos_v3_sign(&mut slot.pcsc, key_ref, to_sign, &mut out) {
+    let n = match apdu::sign(&mut slot.pcsc, key_ref, to_sign, &mut out) {
         Ok(n) => n,
         Err(_) => return CKR_FUNCTION_FAILED,
     };

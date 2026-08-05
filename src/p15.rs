@@ -188,6 +188,9 @@ fn select_ef(pcsc: &mut PcscConn, path: &[u8]) -> Result<(), ()> {
     }
     if path.len() >= 2 && path[0] == 0x3F && path[1] == 0x00 {
         apdu::select_path(pcsc, path, true)
+    } else if path.len() >= 2 && path[0] == 0x7F && path[1] == 0xFF {
+        // Gen2 CDF paths are absolute from the applet ADF (`7FFF/...`).
+        apdu::select_path(pcsc, path, false)
     } else if path.len() == 2 {
         apdu::select_fid(pcsc, ((path[0] as u16) << 8) | path[1] as u16)
     } else {
@@ -516,8 +519,13 @@ fn read_object_value(pcsc: &mut PcscConn, spec: &PathSpec) -> Option<Vec<u8>> {
     }
 }
 
-/// Read an RSA public key from the record-structured key EF. Record
-/// `key_ref` holds the exponent, `key_ref + 2` onwards the modulus.
+/// Read an RSA public key from the record-structured key EF.
+///
+/// Gen1: record `key_ref` holds the exponent, `key_ref + 2` onwards the
+/// modulus (32-bit word reversed).
+///
+/// Gen2: after selecting `0810`/`0811`, `80 B2 keyRef 03/04 00`
+/// returns the two modulus halves directly; exponent is RSA default 65537.
 fn read_pubkey_records(
     pcsc: &mut PcscConn,
     spec: &PathSpec,
@@ -525,6 +533,17 @@ fn read_pubkey_records(
     modulus_bytes: usize,
 ) -> Option<(Vec<u8>, Vec<u8>)> {
     select_ef(pcsc, &spec.bytes).ok()?;
+    if apdu::profile() == apdu::CardProfile::Gen2 {
+        let mut modulus = apdu::gen2::read_pubkey_component(pcsc, key_ref, 0x03).ok()?;
+        modulus.extend(apdu::gen2::read_pubkey_component(pcsc, key_ref, 0x04).ok()?);
+        if modulus_bytes > 0 {
+            modulus.truncate(modulus_bytes);
+        }
+        if modulus.is_empty() {
+            return None;
+        }
+        return Some((modulus, vec![0x01, 0x00, 0x01]));
+    }
     let exponent_rec = apdu::read_record(pcsc, key_ref, PUBKEY_RECORD_LEN).ok()?;
     let mut raw = Vec::with_capacity(modulus_bytes);
     let mut record = key_ref.checked_add(PUBKEY_MODULUS_RECORD)?;
@@ -724,17 +743,27 @@ fn parse_tokeninfo(buf: &[u8], tok: &mut Token) -> Result<(), ()> {
     while off < seq.val.len() {
         let (t, next) = der::next(seq.val, off)?;
         off = next;
-        if t.tag == 0x0C || t.tag == 0x13 || t.tag == 0x16 {
-            if !man_done {
-                tok.manufacturer = copy_label(t.val);
-                man_done = true;
-            } else if !lbl_done {
+        match t.tag {
+            0x04 if tok.serial.chars().all(|c| c == '0') || tok.serial.is_empty() => {
+                let serial = copy_label(t.val);
+                if !serial.is_empty() {
+                    tok.serial = serial;
+                }
+            }
+            0x0C | 0x13 | 0x16 => {
+                if !man_done {
+                    tok.manufacturer = copy_label(t.val);
+                    man_done = true;
+                } else if !lbl_done {
+                    tok.label = copy_label(t.val);
+                    lbl_done = true;
+                }
+            }
+            0x80 => {
                 tok.label = copy_label(t.val);
                 lbl_done = true;
             }
-        } else if t.tag == 0x80 {
-            tok.label = copy_label(t.val);
-            lbl_done = true;
+            _ => {}
         }
     }
     if tok.label.is_empty() {
@@ -744,6 +773,44 @@ fn parse_tokeninfo(buf: &[u8], tok: &mut Token) -> Result<(), ()> {
         tok.manufacturer = "Chunghwa TeleCom Co., Ltd.".into();
     }
     Ok(())
+}
+
+/// Official gen2 model = `T7` + `S`/`U` + 12 decimal digits from the
+/// first 8 bytes of EF.0903 (low 4/4/8 digits of LE u16/u16/u32).
+fn gen2_model_from_serial_prefix(prefix: &[u8], v32: bool) -> String {
+    if prefix.len() < 8 {
+        return if v32 { "T7S".into() } else { "HiCOS".into() };
+    }
+    let w0 = u16::from_le_bytes([prefix[0], prefix[1]]);
+    let w1 = u16::from_le_bytes([prefix[2], prefix[3]]);
+    let w2 = u32::from_le_bytes([prefix[4], prefix[5], prefix[6], prefix[7]]);
+    let mut digits = Vec::with_capacity(16);
+    let mut n = w0 as u32;
+    for _ in 0..4 {
+        digits.push(b'0' + (n % 10) as u8);
+        n /= 10;
+    }
+    digits.reverse();
+    let mut n = w1 as u32;
+    let mut part = [0u8; 4];
+    for i in (0..4).rev() {
+        part[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    digits.extend_from_slice(&part);
+    let mut n = w2;
+    let mut part = [0u8; 8];
+    for i in (0..8).rev() {
+        part[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    digits.extend_from_slice(&part);
+    let flag = if v32 { b'S' } else { b'U' };
+    let mut model = Vec::with_capacity(15);
+    model.extend_from_slice(b"T7");
+    model.push(flag);
+    model.extend_from_slice(&digits[..12.min(digits.len())]);
+    String::from_utf8_lossy(&model).into_owned()
 }
 
 fn read_hicos_tokeninfo_ef(pcsc: &mut PcscConn, tok: &mut Token) {
@@ -765,15 +832,17 @@ fn read_hicos_card_number(pcsc: &mut PcscConn, tok: &mut Token) {
 }
 
 fn read_hicos_model(pcsc: &mut PcscConn, tok: &mut Token) {
-    const PATH: &[u8] = &[0x3F, 0x00, 0x09, 0x00, 0x09, 0x05];
-    if let Ok(buf) = read_ef_bytes(pcsc, PATH, 0, 24) {
-        let version = String::from_utf8_lossy(&buf);
-        tok.model = if version.contains("V32") {
-            "T7S".into()
-        } else {
-            "HiCOS".into()
-        };
+    const PATH_VER: &[u8] = &[0x3F, 0x00, 0x09, 0x00, 0x09, 0x05];
+    const PATH_SN: &[u8] = &[0x3F, 0x00, 0x09, 0x00, 0x09, 0x03];
+    let version = read_ef_bytes(pcsc, PATH_VER, 0, 24).unwrap_or_default();
+    let v32 = String::from_utf8_lossy(&version).contains("V32");
+    if apdu::profile() == apdu::CardProfile::Gen2 {
+        if let Ok(sn) = read_ef_bytes(pcsc, PATH_SN, 0, 8) {
+            tok.model = gen2_model_from_serial_prefix(&sn, v32);
+            return;
+        }
     }
+    tok.model = if v32 { "T7S".into() } else { "HiCOS".into() };
 }
 
 fn read_objects(pcsc: &mut PcscConn, tok: &mut Token) {
@@ -826,7 +895,7 @@ fn link_key_material(tok: &mut Token) {
 
 pub fn bind(pcsc: &mut PcscConn, tok: &mut Token) -> Result<(), ()> {
     *tok = Token::default();
-    let _ = apdu::select_mf(pcsc);
+    apdu::detect_and_select(pcsc)?;
     read_hicos_tokeninfo_ef(pcsc, tok);
     read_hicos_card_number(pcsc, tok);
     read_hicos_model(pcsc, tok);
@@ -838,4 +907,17 @@ pub fn bind(pcsc: &mut PcscConn, tok: &mut Token) -> Result<(), ()> {
 
 pub fn find(tok: &Token, handle: u64) -> Option<&TokenObject> {
     tok.objs.iter().find(|o| o.handle == handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gen2_model_from_serial_prefix;
+
+    #[test]
+    fn gen2_model_matches_official_tokeninfo() {
+        assert_eq!(
+            gen2_model_from_serial_prefix(b"TP072405", true),
+            "T7S056441289235"
+        );
+    }
 }
