@@ -175,12 +175,24 @@ fn rsa_private(
     Ok(())
 }
 
-pub fn sign(
+pub fn rsa_private_op(
     pcsc: &mut PcscConn,
     key_ref: u8,
-    data: &[u8],
+    input: &[u8],
     out: &mut [u8],
 ) -> Result<usize, ()> {
+    if input.len() != RSA_BLOCK_LEN || out.len() < RSA_BLOCK_LEN {
+        return Err(());
+    }
+    let mut block_in = [0u8; RSA_BLOCK_LEN];
+    block_in.copy_from_slice(input);
+    let mut block_out = [0u8; RSA_BLOCK_LEN];
+    rsa_private(pcsc, key_ref, &block_in, &mut block_out)?;
+    out[..RSA_BLOCK_LEN].copy_from_slice(&block_out);
+    Ok(RSA_BLOCK_LEN)
+}
+
+pub fn sign(pcsc: &mut PcscConn, key_ref: u8, data: &[u8], out: &mut [u8]) -> Result<usize, ()> {
     if out.len() < RSA_BLOCK_LEN {
         return Err(());
     }

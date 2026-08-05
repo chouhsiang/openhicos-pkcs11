@@ -32,14 +32,29 @@ Repository: https://github.com/chouhsiang/openhicos-pkcs11
 | 公鑰讀出 | ✅ word-reverse records | ✅ `80 B2 keyRef 03/04` 直讀兩半 |
 | Login | ✅ `8C 20` 3DES | ✅ Diverse + SCP03 + SM VERIFY |
 | Sign | ✅ `80 EA` / `80 C1` | ✅ `84 EA` / `84 C1`（簽前重開 SCP） |
-| Decrypt | ✅ `80 EA`/`C1` + type-2 unpad（工商 KEYX） | ✅ `84 EA`/`84 C1`（同簽章路徑） |
+| Decrypt | ✅ `80 EA`/`C1` + type-2 unpad；OAEP 則 raw + host unpad | ✅ 同左（`84 EA`/`C1`） |
+| Encrypt | ✅ host RSA-PKCS／OAEP（公鑰） | 同左 |
+| Digest / `--hash` | ✅ host MD5／SHA-1/256/384/512 | 同左 |
+| Verify | ✅ host RSA（one-shot／multipart） | 同左 |
+| GenerateRandom | ✅ OS CSPRNG（無卡片 APDU） | 同左 |
+| MechanismInfo | ✅ 含 digest／OAEP flags | 同左 |
 
 ### 實卡驗證環境（使用者機器）
 
 - Reader: `Generic USB2.0-CRW`
-- **一代／工商**：serial `MT00000002872688`；model `T7S`；Login/Sign 與官方一致
-- **一代／自然人**：serial `TP03200302000536`；model `T7S`；走 gen1；憑證／簽章與官方一致
-- **二代／自然人**：serial `TP07240513190395`；model `T7S056441289235`；Login/Sign 與官方一致
+- **一代／工商**：model `T7S`；Login／Sign／Decrypt 與官方一致
+- **一代／自然人**：model `T7S`；走 gen1；憑證／簽章／解密與官方一致
+- **二代／自然人**：model `T7S…`；Login／Sign／Decrypt 與官方一致
+- （serial 等識別資訊不寫入公開文件）
+
+### Host 端功能
+
+- `C_Sign*`／`C_Verify*`：`RSA-PKCS`、`RSA-X-509`、`MD5`／`SHA1`／`SHA256`／`SHA384`／`SHA512-RSA-PKCS`。
+  Hash 機制在 host 組 DigestInfo 後走卡片 PKCS#1 type-1；`RSA-X-509` 為 raw 256-byte。
+- `C_Encrypt*`／`C_Decrypt*`：`RSA-PKCS`、`RSA-X-509`、`RSA-PKCS-OAEP`。X.509 為 raw（無 padding）。
+  OpenSC 0.26+ `pkcs11-tool --encrypt` 僅接受 OAEP（不接受 `RSA-PKCS`／`RSA-X-509`）。
+- `C_GenerateRandom`：使用 OS CSPRNG。攔截官方模組確認其 GenerateRandom 也未送亂數 APDU。
+- `C_GetMechanismInfo`：RSA／OAEP／digest 依實作宣告 flags。
 
 ---
 

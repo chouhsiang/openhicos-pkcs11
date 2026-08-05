@@ -169,15 +169,23 @@ pub fn clear_auth_state() {
 }
 
 /// Dispatch RSA sign to the active card profile.
-pub fn sign(
-    pcsc: &mut PcscConn,
-    key_ref: u8,
-    data: &[u8],
-    out: &mut [u8],
-) -> Result<usize, ()> {
+pub fn sign(pcsc: &mut PcscConn, key_ref: u8, data: &[u8], out: &mut [u8]) -> Result<usize, ()> {
     match profile() {
         CardProfile::Gen1 => gen1::sign(pcsc, key_ref, data, out),
         CardProfile::Gen2 => gen2::sign(pcsc, key_ref, data, out),
+    }
+}
+
+/// Dispatch raw RSA private op (256-byte in → 256-byte out) for decrypt/OAEP.
+pub fn rsa_private_op(
+    pcsc: &mut PcscConn,
+    key_ref: u8,
+    input: &[u8],
+    out: &mut [u8],
+) -> Result<usize, ()> {
+    match profile() {
+        CardProfile::Gen1 => gen1::rsa_private_op(pcsc, key_ref, input, out),
+        CardProfile::Gen2 => gen2::rsa_private_op(pcsc, key_ref, input, out),
     }
 }
 

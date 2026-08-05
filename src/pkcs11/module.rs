@@ -4,13 +4,24 @@ use crate::apdu::{self, PinResult};
 use crate::p15::{self, ObjClass, Token, MAX_OBJS};
 use crate::pcsc::PcscConn;
 use crate::pkcs11::types::*;
-use sha1::{Digest as Sha1Digest, Sha1};
-use sha2::Sha256;
+use num_bigint::BigUint;
+use md5::Md5;
+use sha1::Sha1;
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::sync::Mutex;
 
 const MAX_SLOTS: usize = 8;
 const MAX_SESSIONS: usize = 16;
 const PIN_MAX: u64 = 10;
+const RSA_MODULUS_LEN: usize = 256;
+
+enum DigestCtx {
+    Md5(Md5),
+    Sha1(Sha1),
+    Sha256(Sha256),
+    Sha384(Sha384),
+    Sha512(Sha512),
+}
 
 struct Session {
     in_use: bool,
@@ -27,8 +38,24 @@ struct Session {
     sign_buf: Vec<u8>,
     decrypt_active: bool,
     decrypt_key: CK_OBJECT_HANDLE,
+    decrypt_mech: CK_MECHANISM_TYPE,
     decrypt_buf: Vec<u8>,
     decrypt_plain: Option<Vec<u8>>,
+    decrypt_oaep_hash: CK_MECHANISM_TYPE,
+    decrypt_oaep_label: Vec<u8>,
+    verify_active: bool,
+    verify_key: CK_OBJECT_HANDLE,
+    verify_mech: CK_MECHANISM_TYPE,
+    verify_buf: Vec<u8>,
+    digest_active: bool,
+    digest_ctx: Option<DigestCtx>,
+    encrypt_active: bool,
+    encrypt_key: CK_OBJECT_HANDLE,
+    encrypt_mech: CK_MECHANISM_TYPE,
+    encrypt_buf: Vec<u8>,
+    encrypt_cipher: Option<Vec<u8>>,
+    encrypt_oaep_hash: CK_MECHANISM_TYPE,
+    encrypt_oaep_label: Vec<u8>,
 }
 
 impl Default for Session {
@@ -48,8 +75,24 @@ impl Default for Session {
             sign_buf: Vec::new(),
             decrypt_active: false,
             decrypt_key: 0,
+            decrypt_mech: 0,
             decrypt_buf: Vec::new(),
             decrypt_plain: None,
+            decrypt_oaep_hash: CKM_SHA256,
+            decrypt_oaep_label: Vec::new(),
+            verify_active: false,
+            verify_key: 0,
+            verify_mech: 0,
+            verify_buf: Vec::new(),
+            digest_active: false,
+            digest_ctx: None,
+            encrypt_active: false,
+            encrypt_key: 0,
+            encrypt_mech: 0,
+            encrypt_buf: Vec::new(),
+            encrypt_cipher: None,
+            encrypt_oaep_hash: CKM_SHA256,
+            encrypt_oaep_label: Vec::new(),
         }
     }
 }
@@ -197,6 +240,17 @@ unsafe fn set_attr(attr: &mut CK_ATTRIBUTE, data: &[u8]) -> CK_RV {
     CKR_OK
 }
 
+fn build_digestinfo_md5(hash: &[u8; 16]) -> [u8; 34] {
+    let prefix: [u8; 18] = [
+        0x30, 0x20, 0x30, 0x0c, 0x06, 0x08, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02, 0x05, 0x05,
+        0x00, 0x04, 0x10,
+    ];
+    let mut out = [0u8; 34];
+    out[..18].copy_from_slice(&prefix);
+    out[18..].copy_from_slice(hash);
+    out
+}
+
 fn build_digestinfo_sha1(hash: &[u8; 20]) -> [u8; 35] {
     let prefix: [u8; 15] = [
         0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14,
@@ -216,6 +270,205 @@ fn build_digestinfo_sha256(hash: &[u8; 32]) -> [u8; 51] {
     out[..19].copy_from_slice(&prefix);
     out[19..].copy_from_slice(hash);
     out
+}
+
+fn build_digestinfo_sha384(hash: &[u8; 48]) -> [u8; 67] {
+    let prefix: [u8; 19] = [
+        0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02,
+        0x05, 0x00, 0x04, 0x30,
+    ];
+    let mut out = [0u8; 67];
+    out[..19].copy_from_slice(&prefix);
+    out[19..].copy_from_slice(hash);
+    out
+}
+
+fn build_digestinfo_sha512(hash: &[u8; 64]) -> [u8; 83] {
+    let prefix: [u8; 19] = [
+        0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03,
+        0x05, 0x00, 0x04, 0x40,
+    ];
+    let mut out = [0u8; 83];
+    out[..19].copy_from_slice(&prefix);
+    out[19..].copy_from_slice(hash);
+    out
+}
+
+fn digest_info_for_hash_mech(mech: CK_MECHANISM_TYPE, data: &[u8]) -> Result<Vec<u8>, CK_RV> {
+    Ok(match mech {
+        CKM_MD5_RSA_PKCS => {
+            let hash = Md5::digest(data);
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(&hash);
+            build_digestinfo_md5(&arr).to_vec()
+        }
+        CKM_SHA1_RSA_PKCS => {
+            let hash = Sha1::digest(data);
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(&hash);
+            build_digestinfo_sha1(&arr).to_vec()
+        }
+        CKM_SHA256_RSA_PKCS => {
+            let hash = Sha256::digest(data);
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&hash);
+            build_digestinfo_sha256(&arr).to_vec()
+        }
+        CKM_SHA384_RSA_PKCS => {
+            let hash = Sha384::digest(data);
+            let mut arr = [0u8; 48];
+            arr.copy_from_slice(&hash);
+            build_digestinfo_sha384(&arr).to_vec()
+        }
+        CKM_SHA512_RSA_PKCS => {
+            let hash = Sha512::digest(data);
+            let mut arr = [0u8; 64];
+            arr.copy_from_slice(&hash);
+            build_digestinfo_sha512(&arr).to_vec()
+        }
+        _ => return Err(CKR_MECHANISM_INVALID),
+    })
+}
+
+fn is_hash_rsa_pkcs(mech: CK_MECHANISM_TYPE) -> bool {
+    matches!(
+        mech,
+        CKM_MD5_RSA_PKCS
+            | CKM_SHA1_RSA_PKCS
+            | CKM_SHA256_RSA_PKCS
+            | CKM_SHA384_RSA_PKCS
+            | CKM_SHA512_RSA_PKCS
+    )
+}
+
+fn hash_oaep(hash_alg: CK_MECHANISM_TYPE, data: &[u8]) -> Result<Vec<u8>, CK_RV> {
+    Ok(match hash_alg {
+        CKM_SHA_1 => Sha1::digest(data).to_vec(),
+        CKM_SHA256 => Sha256::digest(data).to_vec(),
+        CKM_SHA384 => Sha384::digest(data).to_vec(),
+        CKM_SHA512 => Sha512::digest(data).to_vec(),
+        _ => return Err(CKR_MECHANISM_INVALID),
+    })
+}
+
+fn mgf1(hash_alg: CK_MECHANISM_TYPE, seed: &[u8], length: usize) -> Result<Vec<u8>, CK_RV> {
+    let mut out = Vec::with_capacity(length);
+    let mut counter = 0u32;
+    while out.len() < length {
+        let mut block = Vec::with_capacity(seed.len() + 4);
+        block.extend_from_slice(seed);
+        block.extend_from_slice(&counter.to_be_bytes());
+        out.extend_from_slice(&hash_oaep(hash_alg, &block)?);
+        counter = counter.checked_add(1).ok_or(CKR_FUNCTION_FAILED)?;
+    }
+    out.truncate(length);
+    Ok(out)
+}
+
+fn oaep_encode(
+    hash_alg: CK_MECHANISM_TYPE,
+    label: &[u8],
+    modulus_len: usize,
+    message: &[u8],
+) -> Result<Vec<u8>, CK_RV> {
+    let h_len = hash_oaep(hash_alg, b"")?.len();
+    if message.len() + 2 * h_len + 2 > modulus_len {
+        return Err(CKR_DATA_LEN_RANGE);
+    }
+    let lhash = hash_oaep(hash_alg, label)?;
+    let ps_len = modulus_len - message.len() - 2 * h_len - 2;
+    let mut db = Vec::with_capacity(modulus_len - h_len - 1);
+    db.extend_from_slice(&lhash);
+    db.extend(std::iter::repeat_n(0u8, ps_len));
+    db.push(0x01);
+    db.extend_from_slice(message);
+    let mut seed = vec![0u8; h_len];
+    getrandom::fill(&mut seed).map_err(|_| CKR_DEVICE_ERROR)?;
+    let db_mask = mgf1(hash_alg, &seed, db.len())?;
+    let masked_db: Vec<u8> = db.iter().zip(db_mask.iter()).map(|(a, b)| a ^ b).collect();
+    let seed_mask = mgf1(hash_alg, &masked_db, h_len)?;
+    let masked_seed: Vec<u8> = seed
+        .iter()
+        .zip(seed_mask.iter())
+        .map(|(a, b)| a ^ b)
+        .collect();
+    let mut em = Vec::with_capacity(modulus_len);
+    em.push(0x00);
+    em.extend_from_slice(&masked_seed);
+    em.extend_from_slice(&masked_db);
+    Ok(em)
+}
+
+fn oaep_decode(
+    hash_alg: CK_MECHANISM_TYPE,
+    label: &[u8],
+    em: &[u8],
+) -> Result<Vec<u8>, CK_RV> {
+    let h_len = hash_oaep(hash_alg, b"")?.len();
+    if em.len() < 2 * h_len + 2 || em[0] != 0x00 {
+        return Err(CKR_ENCRYPTED_DATA_INVALID);
+    }
+    let masked_seed = &em[1..1 + h_len];
+    let masked_db = &em[1 + h_len..];
+    let seed_mask = mgf1(hash_alg, masked_db, h_len)?;
+    let seed: Vec<u8> = masked_seed
+        .iter()
+        .zip(seed_mask.iter())
+        .map(|(a, b)| a ^ b)
+        .collect();
+    let db_mask = mgf1(hash_alg, &seed, masked_db.len())?;
+    let db: Vec<u8> = masked_db
+        .iter()
+        .zip(db_mask.iter())
+        .map(|(a, b)| a ^ b)
+        .collect();
+    let lhash = hash_oaep(hash_alg, label)?;
+    if db.len() < h_len || db[..h_len] != lhash[..] {
+        return Err(CKR_ENCRYPTED_DATA_INVALID);
+    }
+    let mut i = h_len;
+    while i < db.len() && db[i] == 0 {
+        i += 1;
+    }
+    if i >= db.len() || db[i] != 0x01 {
+        return Err(CKR_ENCRYPTED_DATA_INVALID);
+    }
+    Ok(db[i + 1..].to_vec())
+}
+
+fn parse_oaep_params(mech: &CK_MECHANISM) -> Result<(CK_MECHANISM_TYPE, Vec<u8>), CK_RV> {
+    if mech.pParameter.is_null() || mech.ulParameterLen == 0 {
+        return Ok((CKM_SHA256, Vec::new()));
+    }
+    if mech.ulParameterLen as usize != std::mem::size_of::<CK_RSA_PKCS_OAEP_PARAMS>() {
+        return Err(CKR_ARGUMENTS_BAD);
+    }
+    let params = unsafe { &*(mech.pParameter as *const CK_RSA_PKCS_OAEP_PARAMS) };
+    let expected_mgf = match params.hashAlg {
+        CKM_SHA_1 => CKG_MGF1_SHA1,
+        CKM_SHA256 => CKG_MGF1_SHA256,
+        CKM_SHA384 => CKG_MGF1_SHA384,
+        CKM_SHA512 => CKG_MGF1_SHA512,
+        _ => return Err(CKR_MECHANISM_INVALID),
+    };
+    if params.mgf != expected_mgf {
+        return Err(CKR_MECHANISM_INVALID);
+    }
+    let label = if params.source == CKZ_DATA_SPECIFIED
+        && params.ulSourceDataLen > 0
+        && !params.pSourceData.is_null()
+    {
+        unsafe {
+            std::slice::from_raw_parts(
+                params.pSourceData as *const u8,
+                params.ulSourceDataLen as usize,
+            )
+        }
+        .to_vec()
+    } else {
+        Vec::new()
+    };
+    Ok((params.hashAlg, label))
 }
 
 macro_rules! not_supported {
@@ -398,26 +651,77 @@ pub unsafe extern "C" fn c_get_mechanism_list(
         if pul_count.is_null() {
             return CKR_ARGUMENTS_BAD;
         }
-        let mechs = [CKM_RSA_PKCS, CKM_SHA1_RSA_PKCS, CKM_SHA256_RSA_PKCS];
+        let mechs = [
+            CKM_RSA_PKCS,
+            CKM_RSA_X_509,
+            CKM_RSA_PKCS_OAEP,
+            CKM_MD5_RSA_PKCS,
+            CKM_SHA1_RSA_PKCS,
+            CKM_SHA256_RSA_PKCS,
+            CKM_SHA384_RSA_PKCS,
+            CKM_SHA512_RSA_PKCS,
+            CKM_MD5,
+            CKM_SHA_1,
+            CKM_SHA256,
+            CKM_SHA384,
+            CKM_SHA512,
+        ];
         if !p_list.is_null() {
-            if *pul_count < 3 {
+            if (*pul_count as usize) < mechs.len() {
                 return CKR_BUFFER_TOO_SMALL;
             }
             for (i, &m) in mechs.iter().enumerate() {
-                *p_list.add(i) = m;
+                unsafe {
+                    *p_list.add(i) = m;
+                }
             }
         }
-        *pul_count = 3;
+        unsafe {
+            *pul_count = mechs.len() as CK_ULONG;
+        }
         CKR_OK
     })
 }
 
 pub unsafe extern "C" fn c_get_mechanism_info(
-    _s: CK_SLOT_ID,
-    _m: CK_MECHANISM_TYPE,
-    _i: *mut core::ffi::c_void,
+    slot_id: CK_SLOT_ID,
+    mechanism: CK_MECHANISM_TYPE,
+    p_info: *mut CK_MECHANISM_INFO,
 ) -> CK_RV {
-    not_supported!()
+    with_state(|state| {
+        if !state.initialized {
+            return CKR_CRYPTOKI_NOT_INITIALIZED;
+        }
+        if slot_id as usize >= state.slots.len() {
+            return CKR_SLOT_ID_INVALID;
+        }
+        if p_info.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+        let (min_key, max_key, flags) = match mechanism {
+            CKM_RSA_PKCS | CKM_RSA_X_509 => (
+                2048,
+                2048,
+                CKF_HW | CKF_ENCRYPT | CKF_DECRYPT | CKF_SIGN | CKF_VERIFY,
+            ),
+            CKM_RSA_PKCS_OAEP => (1024, 2048, CKF_HW | CKF_ENCRYPT | CKF_DECRYPT),
+            CKM_MD5_RSA_PKCS
+            | CKM_SHA1_RSA_PKCS
+            | CKM_SHA256_RSA_PKCS
+            | CKM_SHA384_RSA_PKCS
+            | CKM_SHA512_RSA_PKCS => (2048, 2048, CKF_HW | CKF_SIGN | CKF_VERIFY),
+            CKM_MD5 | CKM_SHA_1 | CKM_SHA256 | CKM_SHA384 | CKM_SHA512 => (0, 0, CKF_DIGEST),
+            _ => return CKR_MECHANISM_INVALID,
+        };
+        unsafe {
+            *p_info = CK_MECHANISM_INFO {
+                ulMinKeySize: min_key,
+                ulMaxKeySize: max_key,
+                flags,
+            };
+        }
+        CKR_OK
+    })
 }
 
 pub unsafe extern "C" fn c_init_token(
@@ -854,39 +1158,278 @@ pub unsafe extern "C" fn c_find_objects_final(h: CK_SESSION_HANDLE) -> CK_RV {
 }
 
 pub unsafe extern "C" fn c_encrypt_init(
-    _h: CK_SESSION_HANDLE,
-    _m: *mut CK_MECHANISM,
-    _o: CK_OBJECT_HANDLE,
+    h: CK_SESSION_HANDLE,
+    p_mech: *mut CK_MECHANISM,
+    h_key: CK_OBJECT_HANDLE,
 ) -> CK_RV {
-    not_supported!()
+    with_state(|state| {
+        let Some(sess) = session_get(state, h) else {
+            return CKR_SESSION_HANDLE_INVALID;
+        };
+        if p_mech.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+        let mech = unsafe { &*p_mech };
+        if mech.mechanism != CKM_RSA_PKCS
+            && mech.mechanism != CKM_RSA_X_509
+            && mech.mechanism != CKM_RSA_PKCS_OAEP
+        {
+            return CKR_MECHANISM_INVALID;
+        }
+        let (oaep_hash, oaep_label) = if mech.mechanism == CKM_RSA_PKCS_OAEP {
+            match parse_oaep_params(mech) {
+                Ok(v) => v,
+                Err(rv) => return rv,
+            }
+        } else {
+            (CKM_SHA256, Vec::new())
+        };
+        let slot_id = sess.slot;
+        let rv = ensure_card(state, slot_id);
+        if rv != CKR_OK {
+            return rv;
+        }
+        let Some(obj) = p15::find(&state.slots[slot_id as usize].token, h_key) else {
+            return CKR_KEY_HANDLE_INVALID;
+        };
+        if obj.cls != ObjClass::PubKey || !obj.can_encrypt {
+            return CKR_KEY_HANDLE_INVALID;
+        }
+        if obj.modulus.is_empty() || obj.pubexp.is_empty() {
+            return CKR_KEY_HANDLE_INVALID;
+        }
+        let sess = session_get_mut(state, h).unwrap();
+        sess.encrypt_active = true;
+        sess.encrypt_key = h_key;
+        sess.encrypt_mech = mech.mechanism;
+        sess.encrypt_buf.clear();
+        sess.encrypt_cipher = None;
+        sess.encrypt_oaep_hash = oaep_hash;
+        sess.encrypt_oaep_label = oaep_label;
+        CKR_OK
+    })
+}
+
+fn pkcs1_v15_encrypt_block(modulus_len: usize, plaintext: &[u8]) -> Result<Vec<u8>, CK_RV> {
+    if plaintext.len() > modulus_len.saturating_sub(11) {
+        return Err(CKR_DATA_LEN_RANGE);
+    }
+    let ps_len = modulus_len - plaintext.len() - 3;
+    let mut ps = vec![0u8; ps_len];
+    getrandom::fill(&mut ps).map_err(|_| CKR_DEVICE_ERROR)?;
+    for b in &mut ps {
+        while *b == 0 {
+            getrandom::fill(std::slice::from_mut(b)).map_err(|_| CKR_DEVICE_ERROR)?;
+        }
+    }
+    let mut em = Vec::with_capacity(modulus_len);
+    em.push(0x00);
+    em.push(0x02);
+    em.extend_from_slice(&ps);
+    em.push(0x00);
+    em.extend_from_slice(plaintext);
+    Ok(em)
+}
+
+fn rsa_public_crypt(modulus: &[u8], exponent: &[u8], input: &[u8]) -> Result<Vec<u8>, CK_RV> {
+    if modulus.is_empty() || exponent.is_empty() || input.len() != modulus.len() {
+        return Err(CKR_ARGUMENTS_BAD);
+    }
+    let n = BigUint::from_bytes_be(modulus);
+    let e = BigUint::from_bytes_be(exponent);
+    let m = BigUint::from_bytes_be(input);
+    if n == BigUint::from(0u8) || e == BigUint::from(0u8) || m >= n {
+        return Err(CKR_DATA_LEN_RANGE);
+    }
+    let mut out = m.modpow(&e, &n).to_bytes_be();
+    if out.len() > modulus.len() {
+        return Err(CKR_FUNCTION_FAILED);
+    }
+    if out.len() < modulus.len() {
+        let mut padded = vec![0u8; modulus.len() - out.len()];
+        padded.append(&mut out);
+        out = padded;
+    }
+    Ok(out)
+}
+
+fn do_encrypt(
+    state: &mut State,
+    h: CK_SESSION_HANDLE,
+    plaintext: &[u8],
+    p_enc: *mut CK_BYTE,
+    pul_enc_len: *mut CK_ULONG,
+) -> CK_RV {
+    let (slot_id, key) = {
+        let sess = session_get(state, h).unwrap();
+        (sess.slot, sess.encrypt_key)
+    };
+    if p_enc.is_null() {
+        if let Some(cipher) = session_get(state, h).and_then(|s| s.encrypt_cipher.as_ref()) {
+            unsafe {
+                *pul_enc_len = cipher.len() as CK_ULONG;
+            }
+            return CKR_OK;
+        }
+        unsafe {
+            *pul_enc_len = RSA_MODULUS_LEN as CK_ULONG;
+        }
+        return CKR_OK;
+    }
+
+    let cipher =
+        if let Some(cipher) = session_get_mut(state, h).and_then(|s| s.encrypt_cipher.take()) {
+            cipher
+        } else {
+            let (mech, oaep_hash, oaep_label) = {
+                let sess = session_get(state, h).unwrap();
+                (
+                    sess.encrypt_mech,
+                    sess.encrypt_oaep_hash,
+                    sess.encrypt_oaep_label.clone(),
+                )
+            };
+            let Some(obj) = p15::find(&state.slots[slot_id as usize].token, key) else {
+                return CKR_KEY_HANDLE_INVALID;
+            };
+            let em = match mech {
+                CKM_RSA_PKCS => match pkcs1_v15_encrypt_block(obj.modulus.len(), plaintext) {
+                    Ok(v) => v,
+                    Err(rv) => return rv,
+                },
+                CKM_RSA_X_509 => {
+                    if plaintext.len() != obj.modulus.len() {
+                        return CKR_DATA_LEN_RANGE;
+                    }
+                    plaintext.to_vec()
+                }
+                CKM_RSA_PKCS_OAEP => {
+                    match oaep_encode(oaep_hash, &oaep_label, obj.modulus.len(), plaintext) {
+                        Ok(v) => v,
+                        Err(rv) => return rv,
+                    }
+                }
+                _ => return CKR_MECHANISM_INVALID,
+            };
+            match rsa_public_crypt(&obj.modulus, &obj.pubexp, &em) {
+                Ok(v) => v,
+                Err(rv) => return rv,
+            }
+        };
+
+    unsafe {
+        if *pul_enc_len < cipher.len() as CK_ULONG {
+            *pul_enc_len = cipher.len() as CK_ULONG;
+            if let Some(sess) = session_get_mut(state, h) {
+                sess.encrypt_cipher = Some(cipher);
+            }
+            return CKR_BUFFER_TOO_SMALL;
+        }
+        std::ptr::copy_nonoverlapping(cipher.as_ptr(), p_enc, cipher.len());
+        *pul_enc_len = cipher.len() as CK_ULONG;
+    }
+    CKR_OK
 }
 
 pub unsafe extern "C" fn c_encrypt(
-    _h: CK_SESSION_HANDLE,
-    _a: *mut CK_BYTE,
-    _b: CK_ULONG,
-    _c: *mut CK_BYTE,
-    _d: *mut CK_ULONG,
+    h: CK_SESSION_HANDLE,
+    p_data: *mut CK_BYTE,
+    ul_data_len: CK_ULONG,
+    p_enc: *mut CK_BYTE,
+    pul_enc_len: *mut CK_ULONG,
 ) -> CK_RV {
-    not_supported!()
+    with_state(|state| {
+        let Some(sess) = session_get(state, h) else {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        };
+        if !sess.encrypt_active {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        }
+        if pul_enc_len.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+        let data = if ul_data_len == 0 {
+            &[][..]
+        } else if p_data.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        } else {
+            unsafe { std::slice::from_raw_parts(p_data, ul_data_len as usize) }
+        };
+        let rv = do_encrypt(state, h, data, p_enc, pul_enc_len);
+        if !p_enc.is_null() && rv != CKR_BUFFER_TOO_SMALL {
+            let sess = session_get_mut(state, h).unwrap();
+            sess.encrypt_active = false;
+            sess.encrypt_buf.clear();
+            if rv != CKR_OK {
+                sess.encrypt_cipher = None;
+            }
+        }
+        rv
+    })
 }
 
 pub unsafe extern "C" fn c_encrypt_update(
-    _h: CK_SESSION_HANDLE,
-    _a: *mut CK_BYTE,
-    _b: CK_ULONG,
-    _c: *mut CK_BYTE,
-    _d: *mut CK_ULONG,
+    h: CK_SESSION_HANDLE,
+    p_part: *mut CK_BYTE,
+    ul_part_len: CK_ULONG,
+    p_enc: *mut CK_BYTE,
+    pul_enc_len: *mut CK_ULONG,
 ) -> CK_RV {
-    not_supported!()
+    with_state(|state| {
+        let Some(sess) = session_get_mut(state, h) else {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        };
+        if !sess.encrypt_active {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        }
+        if pul_enc_len.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+        if ul_part_len != 0 && p_part.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+        if sess.encrypt_buf.len() + ul_part_len as usize > RSA_MODULUS_LEN {
+            return CKR_DATA_LEN_RANGE;
+        }
+        if ul_part_len != 0 {
+            let part = unsafe { std::slice::from_raw_parts(p_part, ul_part_len as usize) };
+            sess.encrypt_buf.extend_from_slice(part);
+        }
+        unsafe {
+            *pul_enc_len = 0;
+        }
+        let _ = p_enc;
+        CKR_OK
+    })
 }
 
 pub unsafe extern "C" fn c_encrypt_final(
-    _h: CK_SESSION_HANDLE,
-    _a: *mut CK_BYTE,
-    _b: *mut CK_ULONG,
+    h: CK_SESSION_HANDLE,
+    p_last: *mut CK_BYTE,
+    pul_last_len: *mut CK_ULONG,
 ) -> CK_RV {
-    not_supported!()
+    with_state(|state| {
+        let Some(sess) = session_get(state, h) else {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        };
+        if !sess.encrypt_active {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        }
+        if pul_last_len.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+        let plain = sess.encrypt_buf.clone();
+        let rv = do_encrypt(state, h, &plain, p_last, pul_last_len);
+        if !p_last.is_null() && rv != CKR_BUFFER_TOO_SMALL {
+            let sess = session_get_mut(state, h).unwrap();
+            sess.encrypt_active = false;
+            sess.encrypt_buf.clear();
+            if rv != CKR_OK {
+                sess.encrypt_cipher = None;
+            }
+        }
+        rv
+    })
 }
 
 pub unsafe extern "C" fn c_decrypt_init(
@@ -914,17 +1457,31 @@ pub unsafe extern "C" fn c_decrypt_init(
         if obj.cls != ObjClass::PrivKey || !obj.can_decrypt {
             return CKR_KEY_HANDLE_INVALID;
         }
-        if mech.mechanism != CKM_RSA_PKCS {
+        if mech.mechanism != CKM_RSA_PKCS
+            && mech.mechanism != CKM_RSA_X_509
+            && mech.mechanism != CKM_RSA_PKCS_OAEP
+        {
             return CKR_MECHANISM_INVALID;
         }
+        let (oaep_hash, oaep_label) = if mech.mechanism == CKM_RSA_PKCS_OAEP {
+            match parse_oaep_params(mech) {
+                Ok(v) => v,
+                Err(rv) => return rv,
+            }
+        } else {
+            (CKM_SHA256, Vec::new())
+        };
         let _ = logged_in;
         let Some(sess) = session_get_mut(state, h) else {
             return CKR_SESSION_HANDLE_INVALID;
         };
         sess.decrypt_active = true;
         sess.decrypt_key = h_key;
+        sess.decrypt_mech = mech.mechanism;
         sess.decrypt_buf.clear();
         sess.decrypt_plain = None;
+        sess.decrypt_oaep_hash = oaep_hash;
+        sess.decrypt_oaep_label = oaep_label;
         CKR_OK
     })
 }
@@ -936,9 +1493,15 @@ fn do_decrypt(
     p_data: *mut CK_BYTE,
     pul_data_len: *mut CK_ULONG,
 ) -> CK_RV {
-    let (slot_id, key) = {
+    let (slot_id, key, mech, oaep_hash, oaep_label) = {
         let sess = session_get(state, h).unwrap();
-        (sess.slot, sess.decrypt_key)
+        (
+            sess.slot,
+            sess.decrypt_key,
+            sess.decrypt_mech,
+            sess.decrypt_oaep_hash,
+            sess.decrypt_oaep_label.clone(),
+        )
     };
     let key_ref = match p15::find(&state.slots[slot_id as usize].token, key) {
         Some(o) => o.key_ref as u8,
@@ -962,16 +1525,40 @@ fn do_decrypt(
         return CKR_OK;
     }
 
-    let plain = if let Some(plain) = session_get_mut(state, h)
-        .and_then(|s| s.decrypt_plain.take())
+    let plain = if let Some(plain) = session_get_mut(state, h).and_then(|s| s.decrypt_plain.take())
     {
         plain
     } else {
         let slot = &mut state.slots[slot_id as usize];
-        let mut out = [0u8; 512];
-        match apdu::decrypt(&mut slot.pcsc, key_ref, cipher, &mut out) {
-            Ok(n) => out[..n].to_vec(),
-            Err(_) => return CKR_FUNCTION_FAILED,
+        match mech {
+            CKM_RSA_PKCS => {
+                let mut out = [0u8; 512];
+                match apdu::decrypt(&mut slot.pcsc, key_ref, cipher, &mut out) {
+                    Ok(n) => out[..n].to_vec(),
+                    Err(_) => return CKR_FUNCTION_FAILED,
+                }
+            }
+            CKM_RSA_X_509 => {
+                if cipher.len() != RSA_MODULUS_LEN {
+                    return CKR_DATA_LEN_RANGE;
+                }
+                let mut raw = [0u8; RSA_MODULUS_LEN];
+                if apdu::rsa_private_op(&mut slot.pcsc, key_ref, cipher, &mut raw).is_err() {
+                    return CKR_FUNCTION_FAILED;
+                }
+                raw.to_vec()
+            }
+            CKM_RSA_PKCS_OAEP => {
+                let mut raw = [0u8; RSA_MODULUS_LEN];
+                if apdu::rsa_private_op(&mut slot.pcsc, key_ref, cipher, &mut raw).is_err() {
+                    return CKR_FUNCTION_FAILED;
+                }
+                match oaep_decode(oaep_hash, &oaep_label, &raw) {
+                    Ok(v) => v,
+                    Err(rv) => return rv,
+                }
+            }
+            _ => return CKR_MECHANISM_INVALID,
         }
     };
 
@@ -1087,26 +1674,130 @@ pub unsafe extern "C" fn c_decrypt_final(
     })
 }
 
-pub unsafe extern "C" fn c_digest_init(_h: CK_SESSION_HANDLE, _m: *mut CK_MECHANISM) -> CK_RV {
-    not_supported!()
+pub unsafe extern "C" fn c_digest_init(h: CK_SESSION_HANDLE, p_mech: *mut CK_MECHANISM) -> CK_RV {
+    with_state(|state| {
+        let Some(sess) = session_get_mut(state, h) else {
+            return CKR_SESSION_HANDLE_INVALID;
+        };
+        if p_mech.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+        let mechanism = unsafe { (*p_mech).mechanism };
+        let ctx = match mechanism {
+            CKM_MD5 => DigestCtx::Md5(Md5::new()),
+            CKM_SHA_1 => DigestCtx::Sha1(Sha1::new()),
+            CKM_SHA256 => DigestCtx::Sha256(Sha256::new()),
+            CKM_SHA384 => DigestCtx::Sha384(Sha384::new()),
+            CKM_SHA512 => DigestCtx::Sha512(Sha512::new()),
+            _ => return CKR_MECHANISM_INVALID,
+        };
+        sess.digest_active = true;
+        sess.digest_ctx = Some(ctx);
+        CKR_OK
+    })
+}
+
+fn digest_update_ctx(ctx: &mut DigestCtx, data: &[u8]) {
+    match ctx {
+        DigestCtx::Md5(d) => d.update(data),
+        DigestCtx::Sha1(d) => d.update(data),
+        DigestCtx::Sha256(d) => d.update(data),
+        DigestCtx::Sha384(d) => d.update(data),
+        DigestCtx::Sha512(d) => d.update(data),
+    }
+}
+
+fn digest_finalize_ctx(ctx: DigestCtx) -> Vec<u8> {
+    match ctx {
+        DigestCtx::Md5(d) => d.finalize().to_vec(),
+        DigestCtx::Sha1(d) => d.finalize().to_vec(),
+        DigestCtx::Sha256(d) => d.finalize().to_vec(),
+        DigestCtx::Sha384(d) => d.finalize().to_vec(),
+        DigestCtx::Sha512(d) => d.finalize().to_vec(),
+    }
+}
+
+fn digest_output_len(ctx: &DigestCtx) -> usize {
+    match ctx {
+        DigestCtx::Md5(_) => 16,
+        DigestCtx::Sha1(_) => 20,
+        DigestCtx::Sha256(_) => 32,
+        DigestCtx::Sha384(_) => 48,
+        DigestCtx::Sha512(_) => 64,
+    }
 }
 
 pub unsafe extern "C" fn c_digest(
-    _h: CK_SESSION_HANDLE,
-    _a: *mut CK_BYTE,
-    _b: CK_ULONG,
-    _c: *mut CK_BYTE,
-    _d: *mut CK_ULONG,
+    h: CK_SESSION_HANDLE,
+    p_data: *mut CK_BYTE,
+    ul_data_len: CK_ULONG,
+    p_digest: *mut CK_BYTE,
+    pul_digest_len: *mut CK_ULONG,
 ) -> CK_RV {
-    not_supported!()
+    with_state(|state| {
+        let Some(sess) = session_get_mut(state, h) else {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        };
+        if !sess.digest_active || sess.digest_ctx.is_none() {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        }
+        if pul_digest_len.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+        let need = digest_output_len(sess.digest_ctx.as_ref().unwrap());
+        if p_digest.is_null() {
+            unsafe {
+                *pul_digest_len = need as CK_ULONG;
+            }
+            return CKR_OK;
+        }
+        if ul_data_len != 0 && p_data.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+        unsafe {
+            if *pul_digest_len < need as CK_ULONG {
+                *pul_digest_len = need as CK_ULONG;
+                return CKR_BUFFER_TOO_SMALL;
+            }
+        }
+        let data = if ul_data_len == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(p_data, ul_data_len as usize) }
+        };
+        let mut ctx = sess.digest_ctx.take().unwrap();
+        digest_update_ctx(&mut ctx, data);
+        let out = digest_finalize_ctx(ctx);
+        sess.digest_active = false;
+        unsafe {
+            std::ptr::copy_nonoverlapping(out.as_ptr(), p_digest, out.len());
+            *pul_digest_len = out.len() as CK_ULONG;
+        }
+        CKR_OK
+    })
 }
 
 pub unsafe extern "C" fn c_digest_update(
-    _h: CK_SESSION_HANDLE,
-    _a: *mut CK_BYTE,
-    _b: CK_ULONG,
+    h: CK_SESSION_HANDLE,
+    p_part: *mut CK_BYTE,
+    ul_part_len: CK_ULONG,
 ) -> CK_RV {
-    not_supported!()
+    with_state(|state| {
+        let Some(sess) = session_get_mut(state, h) else {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        };
+        if !sess.digest_active || sess.digest_ctx.is_none() {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        }
+        if ul_part_len != 0 && p_part.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+        if ul_part_len != 0 {
+            let part = unsafe { std::slice::from_raw_parts(p_part, ul_part_len as usize) };
+            digest_update_ctx(sess.digest_ctx.as_mut().unwrap(), part);
+        }
+        CKR_OK
+    })
 }
 
 pub unsafe extern "C" fn c_digest_key(_h: CK_SESSION_HANDLE, _o: CK_OBJECT_HANDLE) -> CK_RV {
@@ -1114,11 +1805,42 @@ pub unsafe extern "C" fn c_digest_key(_h: CK_SESSION_HANDLE, _o: CK_OBJECT_HANDL
 }
 
 pub unsafe extern "C" fn c_digest_final(
-    _h: CK_SESSION_HANDLE,
-    _a: *mut CK_BYTE,
-    _b: *mut CK_ULONG,
+    h: CK_SESSION_HANDLE,
+    p_digest: *mut CK_BYTE,
+    pul_digest_len: *mut CK_ULONG,
 ) -> CK_RV {
-    not_supported!()
+    with_state(|state| {
+        let Some(sess) = session_get_mut(state, h) else {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        };
+        if !sess.digest_active || sess.digest_ctx.is_none() {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        }
+        if pul_digest_len.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+        let need = digest_output_len(sess.digest_ctx.as_ref().unwrap());
+        if p_digest.is_null() {
+            unsafe {
+                *pul_digest_len = need as CK_ULONG;
+            }
+            return CKR_OK;
+        }
+        unsafe {
+            if *pul_digest_len < need as CK_ULONG {
+                *pul_digest_len = need as CK_ULONG;
+                return CKR_BUFFER_TOO_SMALL;
+            }
+        }
+        let ctx = sess.digest_ctx.take().unwrap();
+        let out = digest_finalize_ctx(ctx);
+        sess.digest_active = false;
+        unsafe {
+            std::ptr::copy_nonoverlapping(out.as_ptr(), p_digest, out.len());
+            *pul_digest_len = out.len() as CK_ULONG;
+        }
+        CKR_OK
+    })
 }
 
 pub unsafe extern "C" fn c_sign_init(
@@ -1145,8 +1867,8 @@ pub unsafe extern "C" fn c_sign_init(
             return CKR_KEY_HANDLE_INVALID;
         }
         if mech.mechanism != CKM_RSA_PKCS
-            && mech.mechanism != CKM_SHA1_RSA_PKCS
-            && mech.mechanism != CKM_SHA256_RSA_PKCS
+            && mech.mechanism != CKM_RSA_X_509
+            && !is_hash_rsa_pkcs(mech.mechanism)
         {
             return CKR_MECHANISM_INVALID;
         }
@@ -1175,24 +1897,17 @@ fn do_sign(
         None => return CKR_KEY_HANDLE_INVALID,
     };
     let mut dig_buf: Option<Vec<u8>> = None;
-    let to_sign = match sign_mech {
-        CKM_SHA1_RSA_PKCS => {
-            let hash = Sha1::digest(data);
-            let mut arr = [0u8; 20];
-            arr.copy_from_slice(&hash);
-            dig_buf = Some(build_digestinfo_sha1(&arr).to_vec());
-            dig_buf.as_ref().unwrap().as_slice()
+    let to_sign: &[u8] = if is_hash_rsa_pkcs(sign_mech) {
+        match digest_info_for_hash_mech(sign_mech, data) {
+            Ok(v) => {
+                dig_buf = Some(v);
+                dig_buf.as_ref().unwrap().as_slice()
+            }
+            Err(rv) => return rv,
         }
-        CKM_SHA256_RSA_PKCS => {
-            let hash = Sha256::digest(data);
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&hash);
-            dig_buf = Some(build_digestinfo_sha256(&arr).to_vec());
-            dig_buf.as_ref().unwrap().as_slice()
-        }
-        _ => data,
+    } else {
+        data
     };
-    let _ = dig_buf;
     const SIGNATURE_LEN: usize = 256;
     if p_sig.is_null() {
         unsafe {
@@ -1208,10 +1923,23 @@ fn do_sign(
     }
     let slot = &mut state.slots[slot_id as usize];
     let mut out = [0u8; 512];
-    let n = match apdu::sign(&mut slot.pcsc, key_ref, to_sign, &mut out) {
-        Ok(n) => n,
-        Err(_) => return CKR_FUNCTION_FAILED,
+    let n = match sign_mech {
+        CKM_RSA_X_509 => {
+            if to_sign.len() != RSA_MODULUS_LEN {
+                return CKR_DATA_LEN_RANGE;
+            }
+            match apdu::rsa_private_op(&mut slot.pcsc, key_ref, to_sign, &mut out[..RSA_MODULUS_LEN])
+            {
+                Ok(n) => n,
+                Err(_) => return CKR_FUNCTION_FAILED,
+            }
+        }
+        _ => match apdu::sign(&mut slot.pcsc, key_ref, to_sign, &mut out) {
+            Ok(n) => n,
+            Err(_) => return CKR_FUNCTION_FAILED,
+        },
     };
+    let _ = dig_buf;
     unsafe {
         std::ptr::copy_nonoverlapping(out.as_ptr(), p_sig, n);
         *pul_sig_len = n as CK_ULONG;
@@ -1306,37 +2034,227 @@ pub unsafe extern "C" fn c_sign_recover(
 }
 
 pub unsafe extern "C" fn c_verify_init(
-    _h: CK_SESSION_HANDLE,
-    _m: *mut CK_MECHANISM,
-    _o: CK_OBJECT_HANDLE,
+    h: CK_SESSION_HANDLE,
+    p_mech: *mut CK_MECHANISM,
+    h_key: CK_OBJECT_HANDLE,
 ) -> CK_RV {
-    not_supported!()
+    with_state(|state| {
+        let Some(sess) = session_get(state, h) else {
+            return CKR_SESSION_HANDLE_INVALID;
+        };
+        if p_mech.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+        let mechanism = unsafe { (*p_mech).mechanism };
+        if mechanism != CKM_RSA_PKCS
+            && mechanism != CKM_RSA_X_509
+            && !is_hash_rsa_pkcs(mechanism)
+        {
+            return CKR_MECHANISM_INVALID;
+        }
+        let slot_id = sess.slot;
+        let Some(obj) = p15::find(&state.slots[slot_id as usize].token, h_key) else {
+            return CKR_KEY_HANDLE_INVALID;
+        };
+        if obj.cls != ObjClass::PubKey {
+            return CKR_KEY_HANDLE_INVALID;
+        }
+        if !obj.can_verify {
+            return CKR_KEY_FUNCTION_NOT_PERMITTED;
+        }
+        if obj.modulus.is_empty() || obj.pubexp.is_empty() {
+            return CKR_KEY_HANDLE_INVALID;
+        }
+        let sess = session_get_mut(state, h).unwrap();
+        sess.verify_active = true;
+        sess.verify_key = h_key;
+        sess.verify_mech = mechanism;
+        sess.verify_buf.clear();
+        CKR_OK
+    })
+}
+
+fn emsa_pkcs1_v15(payload: &[u8], modulus_len: usize) -> Result<Vec<u8>, CK_RV> {
+    if payload.len() > modulus_len.saturating_sub(11) {
+        return Err(CKR_DATA_LEN_RANGE);
+    }
+    let padding_len = modulus_len - payload.len() - 3;
+    let mut encoded = Vec::with_capacity(modulus_len);
+    encoded.extend_from_slice(&[0x00, 0x01]);
+    encoded.resize(2 + padding_len, 0xFF);
+    encoded.push(0x00);
+    encoded.extend_from_slice(payload);
+    Ok(encoded)
+}
+
+fn verify_rsa_pkcs1_v15(
+    modulus: &[u8],
+    exponent: &[u8],
+    payload: &[u8],
+    signature: &[u8],
+) -> CK_RV {
+    let modulus_len = modulus.len();
+    if signature.len() != modulus_len {
+        return CKR_SIGNATURE_LEN_RANGE;
+    }
+    let n = BigUint::from_bytes_be(modulus);
+    let e = BigUint::from_bytes_be(exponent);
+    let s = BigUint::from_bytes_be(signature);
+    if n == BigUint::from(0u8) || e == BigUint::from(0u8) || s >= n {
+        return CKR_SIGNATURE_INVALID;
+    }
+    let recovered = s.modpow(&e, &n).to_bytes_be();
+    if recovered.len() > modulus_len {
+        return CKR_SIGNATURE_INVALID;
+    }
+    let mut encoded = vec![0u8; modulus_len - recovered.len()];
+    encoded.extend_from_slice(&recovered);
+    let expected = match emsa_pkcs1_v15(payload, modulus_len) {
+        Ok(v) => v,
+        Err(rv) => return rv,
+    };
+    if encoded == expected {
+        CKR_OK
+    } else {
+        CKR_SIGNATURE_INVALID
+    }
+}
+
+fn verify_rsa_x509(modulus: &[u8], exponent: &[u8], data: &[u8], signature: &[u8]) -> CK_RV {
+    let modulus_len = modulus.len();
+    if data.len() != modulus_len {
+        return CKR_DATA_LEN_RANGE;
+    }
+    if signature.len() != modulus_len {
+        return CKR_SIGNATURE_LEN_RANGE;
+    }
+    match rsa_public_crypt(modulus, exponent, signature) {
+        Ok(recovered) if recovered.as_slice() == data => CKR_OK,
+        Ok(_) => CKR_SIGNATURE_INVALID,
+        Err(rv) => rv,
+    }
+}
+
+fn do_verify(state: &mut State, h: CK_SESSION_HANDLE, data: &[u8], signature: &[u8]) -> CK_RV {
+    let (slot_id, key, mechanism) = {
+        let sess = session_get(state, h).unwrap();
+        (sess.slot, sess.verify_key, sess.verify_mech)
+    };
+    let Some(obj) = p15::find(&state.slots[slot_id as usize].token, key) else {
+        return CKR_KEY_HANDLE_INVALID;
+    };
+
+    if mechanism == CKM_RSA_X_509 {
+        return verify_rsa_x509(&obj.modulus, &obj.pubexp, data, signature);
+    }
+
+    let digest_info;
+    let payload = if is_hash_rsa_pkcs(mechanism) {
+        match digest_info_for_hash_mech(mechanism, data) {
+            Ok(v) => {
+                digest_info = v;
+                digest_info.as_slice()
+            }
+            Err(rv) => return rv,
+        }
+    } else if mechanism == CKM_RSA_PKCS {
+        data
+    } else {
+        return CKR_MECHANISM_INVALID;
+    };
+    verify_rsa_pkcs1_v15(&obj.modulus, &obj.pubexp, payload, signature)
 }
 
 pub unsafe extern "C" fn c_verify(
-    _h: CK_SESSION_HANDLE,
-    _a: *mut CK_BYTE,
-    _b: CK_ULONG,
-    _c: *mut CK_BYTE,
-    _d: CK_ULONG,
+    h: CK_SESSION_HANDLE,
+    p_data: *mut CK_BYTE,
+    ul_data_len: CK_ULONG,
+    p_signature: *mut CK_BYTE,
+    ul_signature_len: CK_ULONG,
 ) -> CK_RV {
-    not_supported!()
+    with_state(|state| {
+        let Some(sess) = session_get(state, h) else {
+            return CKR_SESSION_HANDLE_INVALID;
+        };
+        if !sess.verify_active {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        }
+        if (ul_data_len != 0 && p_data.is_null())
+            || (ul_signature_len != 0 && p_signature.is_null())
+        {
+            return CKR_ARGUMENTS_BAD;
+        }
+        let data = if ul_data_len == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(p_data, ul_data_len as usize) }
+        };
+        let signature = if ul_signature_len == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(p_signature, ul_signature_len as usize) }
+        };
+        let rv = do_verify(state, h, data, signature);
+        let sess = session_get_mut(state, h).unwrap();
+        sess.verify_active = false;
+        sess.verify_buf.clear();
+        rv
+    })
 }
 
 pub unsafe extern "C" fn c_verify_update(
-    _h: CK_SESSION_HANDLE,
-    _a: *mut CK_BYTE,
-    _b: CK_ULONG,
+    h: CK_SESSION_HANDLE,
+    p_part: *mut CK_BYTE,
+    ul_part_len: CK_ULONG,
 ) -> CK_RV {
-    not_supported!()
+    with_state(|state| {
+        let Some(sess) = session_get_mut(state, h) else {
+            return CKR_SESSION_HANDLE_INVALID;
+        };
+        if !sess.verify_active {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        }
+        if ul_part_len != 0 && p_part.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+        if sess.verify_buf.len() + ul_part_len as usize > 8192 {
+            return CKR_DATA_LEN_RANGE;
+        }
+        if ul_part_len != 0 {
+            let part = unsafe { std::slice::from_raw_parts(p_part, ul_part_len as usize) };
+            sess.verify_buf.extend_from_slice(part);
+        }
+        CKR_OK
+    })
 }
 
 pub unsafe extern "C" fn c_verify_final(
-    _h: CK_SESSION_HANDLE,
-    _a: *mut CK_BYTE,
-    _b: CK_ULONG,
+    h: CK_SESSION_HANDLE,
+    p_signature: *mut CK_BYTE,
+    ul_signature_len: CK_ULONG,
 ) -> CK_RV {
-    not_supported!()
+    with_state(|state| {
+        let Some(sess) = session_get(state, h) else {
+            return CKR_SESSION_HANDLE_INVALID;
+        };
+        if !sess.verify_active {
+            return CKR_OPERATION_NOT_INITIALIZED;
+        }
+        if ul_signature_len != 0 && p_signature.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+        let data = sess.verify_buf.clone();
+        let signature = if ul_signature_len == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(p_signature, ul_signature_len as usize) }
+        };
+        let rv = do_verify(state, h, &data, signature);
+        let sess = session_get_mut(state, h).unwrap();
+        sess.verify_active = false;
+        sess.verify_buf.clear();
+        rv
+    })
 }
 
 pub unsafe extern "C" fn c_verify_recover_init(
@@ -1464,11 +2382,26 @@ pub unsafe extern "C" fn c_seed_random(
 }
 
 pub unsafe extern "C" fn c_generate_random(
-    _h: CK_SESSION_HANDLE,
-    _a: *mut CK_BYTE,
-    _b: CK_ULONG,
+    h: CK_SESSION_HANDLE,
+    p_random: *mut CK_BYTE,
+    ul_random_len: CK_ULONG,
 ) -> CK_RV {
-    not_supported!()
+    with_state(|state| {
+        if session_get(state, h).is_none() {
+            return CKR_SESSION_HANDLE_INVALID;
+        }
+        if ul_random_len == 0 {
+            return CKR_OK;
+        }
+        if p_random.is_null() {
+            return CKR_ARGUMENTS_BAD;
+        }
+        let out = unsafe { std::slice::from_raw_parts_mut(p_random, ul_random_len as usize) };
+        match getrandom::fill(out) {
+            Ok(()) => CKR_OK,
+            Err(_) => CKR_DEVICE_ERROR,
+        }
+    })
 }
 
 pub unsafe extern "C" fn c_get_function_status(_h: CK_SESSION_HANDLE) -> CK_RV {
@@ -1485,6 +2418,40 @@ pub unsafe extern "C" fn c_wait_for_slot_event(
     _p: *mut core::ffi::c_void,
 ) -> CK_RV {
     not_supported!()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emsa_pkcs1_v15_has_type1_padding() {
+        let encoded = emsa_pkcs1_v15(b"abc", 16).unwrap();
+        assert_eq!(&encoded[..2], &[0x00, 0x01]);
+        assert!(encoded[2..12].iter().all(|&b| b == 0xFF));
+        assert_eq!(&encoded[12..], &[0x00, b'a', b'b', b'c']);
+    }
+
+    #[test]
+    fn oaep_sha256_roundtrip() {
+        let msg = b"openhicos-oaep";
+        let em = oaep_encode(CKM_SHA256, b"", 256, msg).unwrap();
+        assert_eq!(em.len(), 256);
+        assert_eq!(em[0], 0x00);
+        assert_eq!(oaep_decode(CKM_SHA256, b"", &em).unwrap(), msg);
+    }
+
+    #[test]
+    fn pkcs1_v15_encrypt_block_layout() {
+        let msg = b"hello";
+        let em = pkcs1_v15_encrypt_block(256, msg).unwrap();
+        assert_eq!(em.len(), 256);
+        assert_eq!(em[0], 0x00);
+        assert_eq!(em[1], 0x02);
+        assert_eq!(&em[em.len() - msg.len()..], msg);
+        assert_eq!(em[em.len() - msg.len() - 1], 0x00);
+        assert!(em[2..em.len() - msg.len() - 1].iter().all(|&b| b != 0));
+    }
 }
 
 pub static FUNCTION_LIST: CK_FUNCTION_LIST = CK_FUNCTION_LIST {

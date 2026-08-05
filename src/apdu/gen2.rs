@@ -518,13 +518,25 @@ fn rsa_private(
     Ok(())
 }
 
-/// Gen2 RSA sign: re-auth under SCP03, SM-SELECT key DF, then `84 EA` / `84 C1`.
-pub fn sign(
+pub fn rsa_private_op(
     pcsc: &mut PcscConn,
     key_ref: u8,
-    data: &[u8],
+    input: &[u8],
     out: &mut [u8],
 ) -> Result<usize, ()> {
+    if input.len() != RSA_BLOCK_LEN || out.len() < RSA_BLOCK_LEN {
+        return Err(());
+    }
+    let mut block_in = [0u8; RSA_BLOCK_LEN];
+    block_in.copy_from_slice(input);
+    let mut block_out = [0u8; RSA_BLOCK_LEN];
+    rsa_private(pcsc, key_ref, &block_in, &mut block_out)?;
+    out[..RSA_BLOCK_LEN].copy_from_slice(&block_out);
+    Ok(RSA_BLOCK_LEN)
+}
+
+/// Gen2 RSA sign: re-auth under SCP03, SM-SELECT key DF, then `84 EA` / `84 C1`.
+pub fn sign(pcsc: &mut PcscConn, key_ref: u8, data: &[u8], out: &mut [u8]) -> Result<usize, ()> {
     if out.len() < RSA_BLOCK_LEN {
         return Err(());
     }
@@ -566,22 +578,16 @@ mod tests {
         let mut block = [0xAAu8; RSA_BLOCK_LEN];
         block[0] = 0x00;
         block[1] = 0x02;
-        // PS = bytes 2..13 (11 bytes), separator at 13, message follows
-        for b in &mut block[2..13] {
-            *b = 0xAA;
-        }
-        block[13] = 0x00;
-        block[14..].fill(0);
         let msg = b"openhicos-decrypt-test";
-        block[14..14 + msg.len()].copy_from_slice(msg);
+        let separator = RSA_BLOCK_LEN - msg.len() - 1;
+        block[separator] = 0x00;
+        block[separator + 1..].copy_from_slice(msg);
         assert_eq!(pkcs1_v15_unpad_type2(&block).unwrap(), msg);
     }
 
     #[test]
     fn diverse_matches_known_card_keys() {
-        let card_id = [
-            0x24, 0x05, 0x69, 0x64, 0x13, 0x00, 0x01, 0x90, 0x39, 0x57,
-        ];
+        let card_id = [0x24, 0x05, 0x69, 0x64, 0x13, 0x00, 0x01, 0x90, 0x39, 0x57];
         let master = aes_ecb_decrypt(DIVERSE_KEK, &MASTER_ENC_BLOB_16);
         let enc = derive_key(&master, 0x04, &card_id, ISD_CM_AID, 16).unwrap();
         let mac = derive_key(&master, 0x06, &card_id, ISD_CM_AID, 16).unwrap();

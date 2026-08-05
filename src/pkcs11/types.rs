@@ -26,9 +26,11 @@ pub const CKR_ARGUMENTS_BAD: CK_RV = 0x0000_0007;
 pub const CKR_ATTRIBUTE_TYPE_INVALID: CK_RV = 0x0000_0012;
 pub const CKR_DATA_LEN_RANGE: CK_RV = 0x0000_0021;
 pub const CKR_DEVICE_ERROR: CK_RV = 0x0000_0030;
+pub const CKR_ENCRYPTED_DATA_INVALID: CK_RV = 0x0000_0040;
 pub const CKR_FUNCTION_FAILED: CK_RV = 0x0000_0006;
 pub const CKR_FUNCTION_NOT_SUPPORTED: CK_RV = 0x0000_0054;
 pub const CKR_KEY_HANDLE_INVALID: CK_RV = 0x0000_0060;
+pub const CKR_KEY_FUNCTION_NOT_PERMITTED: CK_RV = 0x0000_0068;
 pub const CKR_MECHANISM_INVALID: CK_RV = 0x0000_0070;
 pub const CKR_OBJECT_HANDLE_INVALID: CK_RV = 0x0000_0082;
 pub const CKR_OPERATION_NOT_INITIALIZED: CK_RV = 0x0000_0091;
@@ -37,6 +39,8 @@ pub const CKR_PIN_LOCKED: CK_RV = 0x0000_00A4;
 pub const CKR_SESSION_COUNT: CK_RV = 0x0000_00B1;
 pub const CKR_SESSION_HANDLE_INVALID: CK_RV = 0x0000_00B3;
 pub const CKR_SESSION_PARALLEL_NOT_SUPPORTED: CK_RV = 0x0000_00B4;
+pub const CKR_SIGNATURE_INVALID: CK_RV = 0x0000_00C0;
+pub const CKR_SIGNATURE_LEN_RANGE: CK_RV = 0x0000_00C1;
 pub const CKR_SLOT_ID_INVALID: CK_RV = 0x0000_0003;
 pub const CKR_TOKEN_NOT_PRESENT: CK_RV = 0x0000_00E0;
 pub const CKR_USER_ALREADY_LOGGED_IN: CK_RV = 0x0000_0100;
@@ -56,6 +60,12 @@ pub const CKF_USER_PIN_INITIALIZED: CK_FLAGS = 0x0000_0008;
 pub const CKF_TOKEN_INITIALIZED: CK_FLAGS = 0x0000_0400;
 pub const CKF_SERIAL_SESSION: CK_FLAGS = 0x0000_0004;
 pub const CKF_RW_SESSION: CK_FLAGS = 0x0000_0002;
+pub const CKF_HW: CK_FLAGS = 0x0000_0001;
+pub const CKF_ENCRYPT: CK_FLAGS = 0x0000_0100;
+pub const CKF_DECRYPT: CK_FLAGS = 0x0000_0200;
+pub const CKF_DIGEST: CK_FLAGS = 0x0000_0400;
+pub const CKF_SIGN: CK_FLAGS = 0x0000_0800;
+pub const CKF_VERIFY: CK_FLAGS = 0x0000_2000;
 
 pub const CKU_USER: CK_USER_TYPE = 1;
 
@@ -65,8 +75,24 @@ pub const CKS_RW_PUBLIC_SESSION: CK_STATE = 2;
 pub const CKS_RW_USER_FUNCTIONS: CK_STATE = 3;
 
 pub const CKM_RSA_PKCS: CK_MECHANISM_TYPE = 0x0000_0001;
+pub const CKM_RSA_X_509: CK_MECHANISM_TYPE = 0x0000_0003;
+pub const CKM_MD5_RSA_PKCS: CK_MECHANISM_TYPE = 0x0000_0005;
 pub const CKM_SHA1_RSA_PKCS: CK_MECHANISM_TYPE = 0x0000_0006;
+pub const CKM_RSA_PKCS_OAEP: CK_MECHANISM_TYPE = 0x0000_0009;
 pub const CKM_SHA256_RSA_PKCS: CK_MECHANISM_TYPE = 0x0000_0040;
+pub const CKM_SHA384_RSA_PKCS: CK_MECHANISM_TYPE = 0x0000_0041;
+pub const CKM_SHA512_RSA_PKCS: CK_MECHANISM_TYPE = 0x0000_0042;
+pub const CKM_MD5: CK_MECHANISM_TYPE = 0x0000_0210;
+pub const CKM_SHA_1: CK_MECHANISM_TYPE = 0x0000_0220;
+pub const CKM_SHA256: CK_MECHANISM_TYPE = 0x0000_0250;
+pub const CKM_SHA384: CK_MECHANISM_TYPE = 0x0000_0260;
+pub const CKM_SHA512: CK_MECHANISM_TYPE = 0x0000_0270;
+
+pub const CKG_MGF1_SHA1: CK_ULONG = 0x0000_0001;
+pub const CKG_MGF1_SHA256: CK_ULONG = 0x0000_0002;
+pub const CKG_MGF1_SHA384: CK_ULONG = 0x0000_0003;
+pub const CKG_MGF1_SHA512: CK_ULONG = 0x0000_0004;
+pub const CKZ_DATA_SPECIFIED: CK_ULONG = 0x0000_0001;
 
 pub const CKA_CLASS: CK_ATTRIBUTE_TYPE = 0x0000_0000;
 pub const CKA_TOKEN: CK_ATTRIBUTE_TYPE = 0x0000_0001;
@@ -184,6 +210,24 @@ pub struct CK_MECHANISM {
     pub ulParameterLen: CK_ULONG,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CK_MECHANISM_INFO {
+    pub ulMinKeySize: CK_ULONG,
+    pub ulMaxKeySize: CK_ULONG,
+    pub flags: CK_FLAGS,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CK_RSA_PKCS_OAEP_PARAMS {
+    pub hashAlg: CK_MECHANISM_TYPE,
+    pub mgf: CK_ULONG,
+    pub source: CK_ULONG,
+    pub pSourceData: *mut core::ffi::c_void,
+    pub ulSourceDataLen: CK_ULONG,
+}
+
 pub type CK_C_Initialize = unsafe extern "C" fn(*mut core::ffi::c_void) -> CK_RV;
 pub type CK_C_Finalize = unsafe extern "C" fn(*mut core::ffi::c_void) -> CK_RV;
 pub type CK_C_GetInfo = unsafe extern "C" fn(*mut CK_INFO) -> CK_RV;
@@ -194,7 +238,7 @@ pub type CK_C_GetTokenInfo = unsafe extern "C" fn(CK_SLOT_ID, *mut CK_TOKEN_INFO
 pub type CK_C_GetMechanismList =
     unsafe extern "C" fn(CK_SLOT_ID, *mut CK_MECHANISM_TYPE, *mut CK_ULONG) -> CK_RV;
 pub type CK_C_GetMechanismInfo =
-    unsafe extern "C" fn(CK_SLOT_ID, CK_MECHANISM_TYPE, *mut core::ffi::c_void) -> CK_RV;
+    unsafe extern "C" fn(CK_SLOT_ID, CK_MECHANISM_TYPE, *mut CK_MECHANISM_INFO) -> CK_RV;
 pub type CK_C_InitToken =
     unsafe extern "C" fn(CK_SLOT_ID, *mut CK_UTF8CHAR, CK_ULONG, *mut CK_UTF8CHAR) -> CK_RV;
 pub type CK_C_InitPIN =
