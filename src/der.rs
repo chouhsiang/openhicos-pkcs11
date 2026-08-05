@@ -8,10 +8,6 @@ pub struct DerTlv<'a> {
 }
 
 impl<'a> DerTlv<'a> {
-    pub fn end(&self) -> usize {
-        self.val.len()
-    }
-
     pub fn full_slice(&self, base: &'a [u8]) -> &'a [u8] {
         let start = self.val.as_ptr() as usize - base.as_ptr() as usize - self.hdr_len;
         &base[start..start + self.hdr_len + self.val.len()]

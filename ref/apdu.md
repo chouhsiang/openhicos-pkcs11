@@ -66,13 +66,18 @@
 
 | 用途 | 典型 APDU | 說明 |
 |------|-----------|------|
-| VERIFY | `00 20 00 P2 Lc PIN` | `Card_VerifyPin`、`HiCOS_VerifyPin`、`HiCOSV3_VerifyPin`、`GPPKI_VerifyPin` 等 |
+| VERIFY（一般） | `00 20 00 P2 Lc PIN` | `Card_VerifyPin`、`HiCOS_VerifyPin`、`GPPKI_VerifyPin` 等 |
+| VERIFY（T7S） | `8C 20 00 01 20 IV(8) CIPHERTEXT(24)` | `HiCOSV3_VerifyPin`，安全訊息格式 |
 | CHANGE REFERENCE DATA | `00 24 …` | `HiCOS_ChangeUserPin` / `HiCOS_ChangeSOPin` / `HiCOS_ChangeKey` |
 
 觀察到的實作細節：
 
 - 使用者 PIN 長度上限常見為 **10 bytes（`0x0A`）**
-- `HiCOS_VerifyPin` 會走 `HiCOS_VerifyKey`，金鑰／參照相關常數含 **`0x8C`**
+- T7S `HiCOSV3_VerifyPin` 會 SELECT `3F00/5030/0810`，再走 `HiCOS_VerifyKey`
+- T7S 固定 2-key 3DES key 為 ASCII `CHTTL8f0HiCardV2`（16 bytes），ENC/MAC 相同
+- PIN 以 `FF` 補到 10 bytes；host 產生 8-byte IV
+- MAC = 3DES CBC-MAC（IV=host random、PKCS#7 padding）；再以同一 IV 對
+  `PIN(10) || MAC(8)` 做 3DES CBC + PKCS#7，得到 24-byte ciphertext
 - 若回 **`6A 88`**（referenced data not found），會改用另一組卡標籤字串重試（`CHTTL8f0HiCardV2` ↔ `TLETC812HiCOSV22`）
 - PIN 緩衝會先以 `0xFF` 填滿再拷貝實際 PIN（常見智慧卡 padding 手法）
 
@@ -158,7 +163,75 @@ PSO（Perform Security Operation，`INS=2A`）多半在執行期依機制組裝�
 | UnusedSpace | `CardAPI_Read_EF_UnusedSpace` |
 | 憑證資料 | `CardAPIReadCertData` / `CardAPIWriteCertData` |
 
-常數中亦可見 FID 樣式（高頻出現，需搭配執行路徑才能對到實際檔案）：`3F00`（MF）、`5015`、`5031`–`5035`、`2F00`、`4401` 等。
+---
+
+## 3a. 實卡驗證的檔案配置（T7S / `CHT V32N`）
+
+以 `SCardTransmit` 攔截官方模組 `pkcs11-tool -O` 取得的完整電文，還原出下列配置。
+**沒有標準 PKCS#15 應用**：MF 下 `5015`／`5031` 一律回 `6A82`，官方也從不讀 ODF，
+而是直接 SELECT 專有 DF 與固定 FID。
+
+### DF 與目錄檔
+
+所有存取都是 `SELECT 3F00` → `SELECT 5030` → `SELECT <FID>`，CLA 固定 `0x80`。
+
+| FID | 內容 | 備註 |
+|-----|------|------|
+| `5030` | 專有 PKCS#15 DF | 取代標準 `5015` |
+| `4100` | **PrKDF** | 物件帶 `authId`、commonObjectFlags 有 private 位元 |
+| `4101` | **PuKDF** | 帶 `native=TRUE` |
+| `4104` | **CDF** | |
+| `4107` | **DODF** | |
+| `4108` | **AODF**（推得，未實卡驗證） | |
+| `5032` | TokenInfo | |
+| `08F2` | 憑證資料 EF | 全部憑證串在同一檔，用 CDF 的 index/length 切片 |
+| `0810`/`0811` | 公鑰 record EF | |
+| `0870` | Data object 資料 EF | |
+
+FID 編號規則：**對應 ODF 的 context tag**（PrKDF `[0]`→`4100`、PuKDF `[1]`→`4101`、
+CDF `[4]`→`4104`、DODF `[7]`→`4107`），故 AODF `[8]` 推得為 `4108`。
+
+目錄檔尾端 2 bytes 存內容長度（little-endian，官方以 `80 B0 <size_off> 02` 先讀），
+但 SELECT 不回 FCP，官方是內建檔案大小表；改以「往後讀到 padding（`00`/`FF`）為止」
+同樣可行。
+
+### 憑證讀取
+
+CDF 的 `X509CertificateAttributes` 內 Path 帶 index 與 length：
+
+```
+30 0F  04 06 3F00503008F2   -- path
+       02 01 00             -- index（EF 內起始位移）
+       80 02 06 08          -- [0] length
+```
+
+→ `SELECT 3F00/5030/08F2`，再 `80 B0 <index> C8` 分塊讀 `length` bytes。
+實卡四張憑證位於 offset `0x0000`/`0x0700`/`0x0E00`/`0x1500`。
+
+CDF 同時內含 subject / issuer / serialNumber，可不讀憑證本體就列出摘要；
+但取 `CKA_VALUE` 仍需讀 `08F2`。
+
+### 公鑰讀取（RSA）
+
+公鑰在 `3F00/5030/0810/0811`，以 **READ RECORD** 取得，且 HiCOS 用非 ISO 的定址：
+
+```
+80 B2 <record> 00 81      -- P1=record 編號，P2=0x00，Le=129
+```
+
+每筆 record 129 bytes = `<record 編號 1 byte>` + `<128 bytes 資料>`。
+以 PuKDF 的 `keyReference` 當基底：
+
+| record | 內容 |
+|--------|------|
+| `ref + 0` | 公開指數，位於 offset 1..5（4 bytes big-endian，如 `00 01 00 01` = 65537） |
+| `ref + 1` | 全零（未使用） |
+| `ref + 2` | 模數高半 |
+| `ref + 3` | 模數低半 |
+
+**模數以 32-bit word 反序存放**：把 `rec[ref+2] || rec[ref+3]` 的 256 bytes
+每 4 bytes 一組整組反轉，才會得到憑證裡的 big-endian 模數。實卡上
+`keyReference` 為 `0x01` / `0x05` / `0x11`，已與憑證模數逐位元組核對一致。
 
 ---
 
@@ -187,14 +260,20 @@ PSO（Perform Security Operation，`INS=2A`）多半在執行期依機制組裝�
 2. SELECT MF：`… 3F00`  
 3. SELECT PKI Applet（AID `A00000028300000622010001` 或 PKCS#15 AID）  
 4. （若 GP 卡）`80 50` Initialize Update → `84 82` External Authenticate  
-5. VERIFY PIN：`00 20 00 P2 Lc PIN`  
+5. VERIFY PIN：依卡別使用明文 VERIFY 或 T7S `8C 20` 安全格式  
 6. 讀 PrKDF／CDF／憑證 EF（SELECT + READ BINARY 分塊）
 
 ### 5.2 簽章
 
-1. （可選）MSE SET：`00 22 …` 指定私鑰與演算法  
-2. PSO / 卡專有 Sign APDU（由 `CardAPI_PKCS1_*` / `HiCOSV3_PKCS1_*` 組裝）  
-3. 若 `61 XX` → GET RESPONSE
+T7S / 2048-bit RSA 的實卡流程：
+
+1. host 建立 `00 01 FF…FF 00 DigestInfo`（256 bytes）  
+2. `80 EA 82 <keyRef> 80 <block[0..128]>`  
+3. `80 EA 02 <keyRef> 80 <block[128..256]>`，回簽章前 128 bytes  
+4. `80 C1 00 80 80`，回簽章後 128 bytes
+
+此路徑不使用 MSE/PSO；官方與 openhicos 對同一訊息的 256-byte
+SHA256-RSA-PKCS 簽章已逐位元組核對一致。
 
 ### 5.3 變更 PIN
 

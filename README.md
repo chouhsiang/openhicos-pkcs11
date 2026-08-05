@@ -8,24 +8,21 @@ Drop-in style alternative to proprietary `libHicos_p11v1.dylib` for tools that
 load a Cryptoki module (e.g. `pkcs11-tool`).
 
 > **Not affiliated with** 內政部 or 中華電信. Clean-room work based on
-> ISO 7816 / PKCS#15 and independent APDU notes (`ref/apdu.md`, `docs/apdu-notes.md`).
+> ISO 7816 / PKCS#15 and independent APDU notes (`ref/apdu.md`).
 
 **AI / 開發交接**：請先讀 [`AGENTS.md`](AGENTS.md)（歷程、實卡發現、待辦）。
 
 ## Build
 
-Requires [Rust](https://rustup.rs/) (1.70+).
-
-### macOS / Linux
+Requires [Rust](https://rustup.rs/) (1.85+).
 
 ```bash
-cd openhicos
 make
 # → build/openhicos-pkcs11-macos-arm64.so
 # → build/openhicos-pkcs11-linux-x86_64.so
 ```
 
-Or directly with Cargo:
+Or with Cargo:
 
 ```bash
 cargo build --release
@@ -35,47 +32,6 @@ cargo build --release
 
 - macOS: system **PCSC.framework** (via `pcsc` crate)
 - Linux: **pcsc-lite** (`libpcsclite-dev`)
-
-### Legacy C build (optional)
-
-Original C sources remain under `pkcs11/` for reference:
-
-```bash
-make -f Makefile.legacy
-```
-
-### Windows (native)
-
-**MSVC**（Developer Command Prompt）:
-
-```bat
-build-windows.bat
-REM → build\openhicos-pkcs11-windows-x86_64.so
-```
-
-**MSYS2 / MinGW**:
-
-```bash
-pacman -S mingw-w64-x86_64-gcc
-make
-# → build/openhicos-pkcs11-windows-x86_64.so
-```
-
-**CMake**（MSVC 或 MinGW）:
-
-```bat
-cmake -B build-win -A x64
-cmake --build build-win --config Release
-```
-
-### Cross-compile Windows from macOS / Linux
-
-```bash
-# macOS: brew install mingw-w64
-# Debian: apt install mingw-w64
-make windows
-# → build/openhicos-pkcs11-windows-x86_64.so
-```
 
 ## Use with pkcs11-tool
 
@@ -87,53 +43,53 @@ pkcs11-tool --module "$MOD" -L
 pkcs11-tool --module "$MOD" -O
 pkcs11-tool --module "$MOD" --login -O
 pkcs11-tool --module "$MOD" --login \
-  --sign --mechanism SHA256-RSA-PKCS -i msg.bin -o sig.bin
+  --sign --mechanism SHA256-RSA-PKCS --id 5349474e \
+  -i msg.bin -o sig.bin
 pkcs11-tool --module "$MOD" --login \
   --decrypt --mechanism RSA-PKCS -i cipher.bin -o plain.bin
 ```
 
-Windows example:
+官方對照（本機 `ref/`，勿散佈）:
 
-```bat
-pkcs11-tool --module build\openhicos-pkcs11-windows-x86_64.so -L
+```bash
+pkcs11-tool --module ./ref/libHicos_p11v1.dylib -L
+pkcs11-tool --module ./ref/libHicos_p11v1.dylib -O --type cert
 ```
 
 ## Implemented
 
 | Feature | Notes |
 |---------|--------|
-| Slots / TokenInfo | PC/SC readers; label/serial from EF.TokenInfo when present |
-| PKCS#15 bind | SELECT AID/`5015`, read ODF → PrKDF / CDF / AODF |
-| Objects | Certificates, public keys, private keys (+ attributes) |
-| Login | VERIFY PIN (tries TokenInfo/AODF ref, `00`, `01`, `8C`) |
-| Sign | MSE + PSO CDS; `CKM_RSA_PKCS` / `SHA1-RSA-PKCS` / `SHA256-RSA-PKCS` |
-| Decrypt | MSE + PSO Decipher; `CKM_RSA_PKCS` |
+| Slots / TokenInfo | PC/SC；label/serial/model 對齊官方（實卡 T7S 驗證） |
+| Object discovery | HiCOS 專有 DF `5030`（PrKDF/PuKDF/CDF/DODF），`-O` 與官方逐行一致 |
+| Certificates | 從共用 EF `08F2` 依 index/length 切片讀出，openssl 可完整解析 |
+| Public keys | READ RECORD + 32-bit word 反序還原模數 |
+| Data objects | DODF，含 application / OID |
+| Login | T7S 安全 VERIFY PIN（3DES CBC + MAC），實卡驗證 |
+| Sign | HiCOS V3 `EA` / `C1` RSA；RSA-PKCS / SHA1 / SHA256 均與官方逐位元組一致 |
+| Decrypt | MSE + PSO Decipher；`CKM_RSA_PKCS` |
 
 ## Limits
 
-- Card layouts differ across HiCOS generations; some FIDs/key refs may need tuning on real hardware.
-- No GlobalPlatform SCP path yet.
-- No host-side verify / encrypt.
-- Must be validated with a physical card + reader.
+- Decrypt 尚未在實卡端到端驗證
+- 只取樣過 T7S（`CHT V32N`）+ 2048-bit 金鑰；其他 HiCOS 世代未驗
+- T7S 登入／簽章流程不應直接套用到其他 HiCOS 世代
 
 ## Layout
 
 ```text
 openhicos/
   Cargo.toml
-  Makefile           # Rust build (default)
-  Makefile.legacy    # optional C build
+  Makefile
   src/
     lib.rs           # C_GetFunctionList export
     pcsc.rs          # PC/SC transport
     apdu.rs          # HiCOS APDU (CLA 0x80)
     der.rs           # ASN.1/DER parser
-    p15.rs           # PKCS#15 bind + objects
+    p15.rs           # HiCOS bind: TokenInfo + object discovery
     pkcs11/          # Cryptoki types + C_* API
-  pkcs11/            # legacy C sources (reference)
-  ref/               # libHicos_p11v1.dylib + apdu.md（官方對照，勿公開散佈 dylib）
-  build/             # final module: openhicos-pkcs11-<os>-<arch>.so
-  docs/apdu-notes.md
+  ref/               # 官方 dylib + apdu.md（對照用）
+  build/             # openhicos-pkcs11-<os>-<arch>.so
   AGENTS.md          # AI handoff / 開發日誌
 ```
 

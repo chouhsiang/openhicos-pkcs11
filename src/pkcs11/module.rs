@@ -5,7 +5,7 @@ use crate::p15::{self, ObjClass, Token, MAX_OBJS};
 use crate::pcsc::PcscConn;
 use crate::pkcs11::types::*;
 use sha1::{Digest as Sha1Digest, Sha1};
-use sha2::{Digest as Sha256Digest, Sha256};
+use sha2::Sha256;
 use std::sync::Mutex;
 
 const MAX_SLOTS: usize = 8;
@@ -130,29 +130,34 @@ fn ensure_card(state: &mut State, slot_id: CK_SLOT_ID) -> CK_RV {
     CKR_OK
 }
 
+fn object_class(o: &p15::TokenObject) -> CK_ULONG {
+    match o.cls {
+        ObjClass::PrivKey => CKO_PRIVATE_KEY,
+        ObjClass::PubKey => CKO_PUBLIC_KEY,
+        ObjClass::Cert => CKO_CERTIFICATE,
+        ObjClass::Data => CKO_DATA,
+    }
+}
+
 fn attr_match(o: &p15::TokenObject, tmpl: &[CK_ATTRIBUTE]) -> bool {
     for t in tmpl {
         unsafe {
             match t.type_ {
                 CKA_CLASS if !t.pValue.is_null() && t.ulValueLen == 8 => {
-                    let cls = *(t.pValue as *const CK_ULONG);
-                    let have = match o.cls {
-                        ObjClass::PrivKey => CKO_PRIVATE_KEY,
-                        ObjClass::PubKey => CKO_PUBLIC_KEY,
-                        ObjClass::Cert => CKO_CERTIFICATE,
-                    };
-                    if cls != have {
+                    if *(t.pValue as *const CK_ULONG) != object_class(o) {
                         return false;
                     }
                 }
                 CKA_ID if !t.pValue.is_null() => {
-                    let slice = std::slice::from_raw_parts(t.pValue as *const u8, t.ulValueLen as usize);
+                    let slice =
+                        std::slice::from_raw_parts(t.pValue as *const u8, t.ulValueLen as usize);
                     if slice.len() != o.id.len() || slice != o.id.as_slice() {
                         return false;
                     }
                 }
                 CKA_LABEL if !t.pValue.is_null() => {
-                    let slice = std::slice::from_raw_parts(t.pValue as *const u8, t.ulValueLen as usize);
+                    let slice =
+                        std::slice::from_raw_parts(t.pValue as *const u8, t.ulValueLen as usize);
                     if slice.len() != o.label.len() || slice != o.label.as_bytes() {
                         return false;
                     }
@@ -263,7 +268,10 @@ pub unsafe extern "C" fn c_get_info(p_info: *mut CK_INFO) -> CK_RV {
             return CKR_ARGUMENTS_BAD;
         }
         let info = &mut *p_info;
-        info.cryptokiVersion = CK_VERSION { major: 2, minor: 40 };
+        info.cryptokiVersion = CK_VERSION {
+            major: 2,
+            minor: 40,
+        };
         fill_blank(&mut info.manufacturerID, "openhicos");
         fill_blank(&mut info.libraryDescription, "openhicos PKCS#11");
         info.libraryVersion = CK_VERSION { major: 0, minor: 2 };
@@ -324,7 +332,10 @@ pub unsafe extern "C" fn c_get_slot_info(slot_id: CK_SLOT_ID, p_info: *mut CK_SL
     })
 }
 
-pub unsafe extern "C" fn c_get_token_info(slot_id: CK_SLOT_ID, p_info: *mut CK_TOKEN_INFO) -> CK_RV {
+pub unsafe extern "C" fn c_get_token_info(
+    slot_id: CK_SLOT_ID,
+    p_info: *mut CK_TOKEN_INFO,
+) -> CK_RV {
     with_state(|state| {
         if !state.initialized {
             return CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -345,7 +356,8 @@ pub unsafe extern "C" fn c_get_token_info(slot_id: CK_SLOT_ID, p_info: *mut CK_T
         fill_blank(&mut info.manufacturerID, &slot.token.manufacturer);
         fill_blank(&mut info.model, &slot.token.model);
         fill_blank(&mut info.serialNumber, &slot.token.serial);
-        info.flags = CKF_RNG | CKF_LOGIN_REQUIRED | CKF_USER_PIN_INITIALIZED | CKF_TOKEN_INITIALIZED;
+        info.flags =
+            CKF_RNG | CKF_LOGIN_REQUIRED | CKF_USER_PIN_INITIALIZED | CKF_TOKEN_INITIALIZED;
         info.ulMaxPinLen = if slot.token.max_pin != 0 {
             slot.token.max_pin
         } else {
@@ -364,8 +376,8 @@ pub unsafe extern "C" fn c_get_token_info(slot_id: CK_SLOT_ID, p_info: *mut CK_T
         info.ulFreePublicMemory = CK_UNAVAILABLE_INFORMATION;
         info.ulTotalPrivateMemory = CK_UNAVAILABLE_INFORMATION;
         info.ulFreePrivateMemory = CK_UNAVAILABLE_INFORMATION;
-        info.hardwareVersion = CK_VERSION { major: 0, minor: 0 };
-        info.firmwareVersion = CK_VERSION { major: 0, minor: 0 };
+        info.hardwareVersion = CK_VERSION { major: 1, minor: 0 };
+        info.firmwareVersion = CK_VERSION { major: 1, minor: 0 };
         CKR_OK
     })
 }
@@ -413,7 +425,11 @@ pub unsafe extern "C" fn c_init_token(
     not_supported!()
 }
 
-pub unsafe extern "C" fn c_init_pin(_h: CK_SESSION_HANDLE, _p: *mut CK_UTF8CHAR, _n: CK_ULONG) -> CK_RV {
+pub unsafe extern "C" fn c_init_pin(
+    _h: CK_SESSION_HANDLE,
+    _p: *mut CK_UTF8CHAR,
+    _n: CK_ULONG,
+) -> CK_RV {
     not_supported!()
 }
 
@@ -497,7 +513,10 @@ pub unsafe extern "C" fn c_close_all_sessions(slot_id: CK_SLOT_ID) -> CK_RV {
     })
 }
 
-pub unsafe extern "C" fn c_get_session_info(h: CK_SESSION_HANDLE, p_info: *mut CK_SESSION_INFO) -> CK_RV {
+pub unsafe extern "C" fn c_get_session_info(
+    h: CK_SESSION_HANDLE,
+    p_info: *mut CK_SESSION_INFO,
+) -> CK_RV {
     with_state(|state| {
         let Some(sess) = session_get(state, h) else {
             return CKR_SESSION_HANDLE_INVALID;
@@ -554,30 +573,12 @@ pub unsafe extern "C" fn c_login(
         let pin = std::slice::from_raw_parts(p_pin, ul_pin_len as usize);
         let slot_id = sess.slot;
         let pin_ref = state.slots[slot_id as usize].token.pin_ref;
-        let mut refs = vec![pin_ref];
-        if pin_ref != 0x00 {
-            refs.push(0x00);
-        }
-        if pin_ref != 0x01 {
-            refs.push(0x01);
-        }
-        refs.push(0x8C);
         let slot = &mut state.slots[slot_id as usize];
-        let mut ok = false;
-        for r in refs {
-            match apdu::verify_pin(&mut slot.pcsc, r, pin) {
-                PinResult::Ok => {
-                    slot.token.pin_ref = r;
-                    ok = true;
-                    break;
-                }
-                PinResult::Locked => return CKR_PIN_LOCKED,
-                PinResult::Incorrect => {}
-                PinResult::Error => {}
-            }
-        }
-        if !ok {
-            return CKR_PIN_INCORRECT;
+        match apdu::verify_pin(&mut slot.pcsc, pin_ref, pin) {
+            PinResult::Ok => {}
+            PinResult::Locked => return CKR_PIN_LOCKED,
+            PinResult::Incorrect => return CKR_PIN_INCORRECT,
+            PinResult::Error => return CKR_DEVICE_ERROR,
         }
         let sess = session_get_mut(state, h).unwrap();
         sess.logged_in = true;
@@ -662,28 +663,25 @@ pub unsafe extern "C" fn c_get_attribute_value(
         let bfalse = CK_FALSE;
         let kt = CKK_RSA.to_le_bytes();
         let ct = CKC_X_509.to_le_bytes();
+        let is_key = matches!(obj.cls, ObjClass::PrivKey | ObjClass::PubKey);
+        let is_private_key = obj.cls == ObjClass::PrivKey;
+        let bool_attr = |attr: &mut CK_ATTRIBUTE, value: bool| {
+            set_attr(attr, &[if value { btrue } else { bfalse }])
+        };
         for attr in tmpl {
             let r = match attr.type_ {
-                CKA_CLASS => {
-                    let ul = match obj.cls {
-                        ObjClass::PrivKey => CKO_PRIVATE_KEY,
-                        ObjClass::PubKey => CKO_PUBLIC_KEY,
-                        ObjClass::Cert => CKO_CERTIFICATE,
-                    };
-                    set_attr(attr, &ul.to_le_bytes())
+                CKA_CLASS => set_attr(attr, &object_class(obj).to_le_bytes()),
+                CKA_TOKEN => bool_attr(attr, true),
+                CKA_PRIVATE => bool_attr(attr, obj.private),
+                CKA_MODIFIABLE => bool_attr(attr, obj.modifiable),
+                CKA_LOCAL if !is_key => {
+                    attr.ulValueLen = CK_UNAVAILABLE_INFORMATION;
+                    CKR_ATTRIBUTE_TYPE_INVALID
                 }
-                CKA_TOKEN => set_attr(attr, &[btrue]),
-                CKA_PRIVATE => {
-                    let b = if obj.cls == ObjClass::PrivKey {
-                        CK_TRUE
-                    } else {
-                        CK_FALSE
-                    };
-                    set_attr(attr, &[b])
-                }
+                CKA_LOCAL => bool_attr(attr, obj.local),
                 CKA_LABEL => set_attr(attr, obj.label.as_bytes()),
                 CKA_ID => set_attr(attr, &obj.id),
-                CKA_KEY_TYPE if obj.cls == ObjClass::Cert => {
+                CKA_KEY_TYPE if !is_key => {
                     attr.ulValueLen = CK_UNAVAILABLE_INFORMATION;
                     CKR_ATTRIBUTE_TYPE_INVALID
                 }
@@ -693,7 +691,32 @@ pub unsafe extern "C" fn c_get_attribute_value(
                     CKR_ATTRIBUTE_TYPE_INVALID
                 }
                 CKA_CERTIFICATE_TYPE => set_attr(attr, &ct),
-                CKA_VALUE if obj.cls != ObjClass::Cert || obj.data.is_empty() => {
+                CKA_SUBJECT if obj.subject.is_empty() => {
+                    attr.ulValueLen = CK_UNAVAILABLE_INFORMATION;
+                    CKR_ATTRIBUTE_TYPE_INVALID
+                }
+                CKA_SUBJECT => set_attr(attr, &obj.subject),
+                CKA_ISSUER if obj.issuer.is_empty() => {
+                    attr.ulValueLen = CK_UNAVAILABLE_INFORMATION;
+                    CKR_ATTRIBUTE_TYPE_INVALID
+                }
+                CKA_ISSUER => set_attr(attr, &obj.issuer),
+                CKA_SERIAL_NUMBER if obj.serial.is_empty() => {
+                    attr.ulValueLen = CK_UNAVAILABLE_INFORMATION;
+                    CKR_ATTRIBUTE_TYPE_INVALID
+                }
+                CKA_SERIAL_NUMBER => set_attr(attr, &obj.serial),
+                CKA_APPLICATION if obj.application.is_empty() => {
+                    attr.ulValueLen = CK_UNAVAILABLE_INFORMATION;
+                    CKR_ATTRIBUTE_TYPE_INVALID
+                }
+                CKA_APPLICATION => set_attr(attr, obj.application.as_bytes()),
+                CKA_OBJECT_ID if obj.app_oid.is_empty() => {
+                    attr.ulValueLen = CK_UNAVAILABLE_INFORMATION;
+                    CKR_ATTRIBUTE_TYPE_INVALID
+                }
+                CKA_OBJECT_ID => set_attr(attr, &obj.app_oid),
+                CKA_VALUE if obj.data.is_empty() => {
                     attr.ulValueLen = CK_UNAVAILABLE_INFORMATION;
                     CKR_ATTRIBUTE_TYPE_INVALID
                 }
@@ -703,7 +726,7 @@ pub unsafe extern "C" fn c_get_attribute_value(
                     CKR_ATTRIBUTE_TYPE_INVALID
                 }
                 CKA_MODULUS => set_attr(attr, &obj.modulus),
-                CKA_MODULUS_BITS if obj.modulus_bits == 0 => {
+                CKA_MODULUS_BITS if obj.modulus_bits == 0 || !is_key => {
                     attr.ulValueLen = CK_UNAVAILABLE_INFORMATION;
                     CKR_ATTRIBUTE_TYPE_INVALID
                 }
@@ -713,22 +736,18 @@ pub unsafe extern "C" fn c_get_attribute_value(
                     CKR_ATTRIBUTE_TYPE_INVALID
                 }
                 CKA_PUBLIC_EXPONENT => set_attr(attr, &obj.pubexp),
-                CKA_SIGN => {
-                    let b = if obj.can_sign { CK_TRUE } else { CK_FALSE };
-                    set_attr(attr, &[b])
+                CKA_SIGN => bool_attr(attr, obj.can_sign),
+                CKA_SIGN_RECOVER | CKA_VERIFY_RECOVER | CKA_DERIVE => bool_attr(attr, false),
+                CKA_DECRYPT => bool_attr(attr, obj.can_decrypt),
+                CKA_VERIFY => bool_attr(attr, obj.can_verify),
+                CKA_ENCRYPT => bool_attr(attr, obj.can_encrypt),
+                CKA_WRAP => bool_attr(attr, obj.can_wrap),
+                CKA_UNWRAP => bool_attr(attr, obj.can_unwrap),
+                CKA_SENSITIVE | CKA_ALWAYS_SENSITIVE | CKA_NEVER_EXTRACTABLE => {
+                    bool_attr(attr, is_private_key)
                 }
-                CKA_DECRYPT => {
-                    let b = if obj.can_decrypt { CK_TRUE } else { CK_FALSE };
-                    set_attr(attr, &[b])
-                }
-                CKA_VERIFY => {
-                    let b = if obj.can_verify { CK_TRUE } else { CK_FALSE };
-                    set_attr(attr, &[b])
-                }
-                CKA_ENCRYPT | CKA_SENSITIVE => {
-                    let b = if attr.type_ == CKA_SENSITIVE { CK_TRUE } else { CK_FALSE };
-                    set_attr(attr, &[b])
-                }
+                CKA_EXTRACTABLE => bool_attr(attr, false),
+                CKA_ALWAYS_AUTHENTICATE => bool_attr(attr, false),
                 _ => {
                     attr.ulValueLen = CK_UNAVAILABLE_INFORMATION;
                     CKR_ATTRIBUTE_TYPE_INVALID
@@ -775,7 +794,7 @@ pub unsafe extern "C" fn c_find_objects_init(
             .objs
             .iter()
             .filter(|obj| {
-                if obj.cls == ObjClass::PrivKey && !logged_in {
+                if (obj.private || obj.cls == ObjClass::PrivKey) && !logged_in {
                     return false;
                 }
                 attr_match(obj, tmpl)
@@ -857,7 +876,11 @@ pub unsafe extern "C" fn c_encrypt_update(
     not_supported!()
 }
 
-pub unsafe extern "C" fn c_encrypt_final(_h: CK_SESSION_HANDLE, _a: *mut CK_BYTE, _b: *mut CK_ULONG) -> CK_RV {
+pub unsafe extern "C" fn c_encrypt_final(
+    _h: CK_SESSION_HANDLE,
+    _a: *mut CK_BYTE,
+    _b: *mut CK_ULONG,
+) -> CK_RV {
     not_supported!()
 }
 
@@ -918,8 +941,7 @@ pub unsafe extern "C" fn c_decrypt(
         }
         let slot_id = sess.slot;
         let key = sess.decrypt_key;
-        let key_ref = p15::find(&state.slots[slot_id as usize].token, key)
-            .map(|o| o.key_ref as u8);
+        let key_ref = p15::find(&state.slots[slot_id as usize].token, key).map(|o| o.key_ref as u8);
         let Some(key_ref) = key_ref else {
             return CKR_KEY_HANDLE_INVALID;
         };
@@ -961,7 +983,11 @@ pub unsafe extern "C" fn c_decrypt_update(
     not_supported!()
 }
 
-pub unsafe extern "C" fn c_decrypt_final(_h: CK_SESSION_HANDLE, _a: *mut CK_BYTE, _b: *mut CK_ULONG) -> CK_RV {
+pub unsafe extern "C" fn c_decrypt_final(
+    _h: CK_SESSION_HANDLE,
+    _a: *mut CK_BYTE,
+    _b: *mut CK_ULONG,
+) -> CK_RV {
     not_supported!()
 }
 
@@ -979,7 +1005,11 @@ pub unsafe extern "C" fn c_digest(
     not_supported!()
 }
 
-pub unsafe extern "C" fn c_digest_update(_h: CK_SESSION_HANDLE, _a: *mut CK_BYTE, _b: CK_ULONG) -> CK_RV {
+pub unsafe extern "C" fn c_digest_update(
+    _h: CK_SESSION_HANDLE,
+    _a: *mut CK_BYTE,
+    _b: CK_ULONG,
+) -> CK_RV {
     not_supported!()
 }
 
@@ -987,7 +1017,11 @@ pub unsafe extern "C" fn c_digest_key(_h: CK_SESSION_HANDLE, _o: CK_OBJECT_HANDL
     not_supported!()
 }
 
-pub unsafe extern "C" fn c_digest_final(_h: CK_SESSION_HANDLE, _a: *mut CK_BYTE, _b: *mut CK_ULONG) -> CK_RV {
+pub unsafe extern "C" fn c_digest_final(
+    _h: CK_SESSION_HANDLE,
+    _a: *mut CK_BYTE,
+    _b: *mut CK_ULONG,
+) -> CK_RV {
     not_supported!()
 }
 
@@ -1063,25 +1097,26 @@ fn do_sign(
         _ => data,
     };
     let _ = dig_buf;
-    let slot = &mut state.slots[slot_id as usize];
-    if apdu::mse_set_dst(&mut slot.pcsc, key_ref).is_err() {
-        return CKR_DEVICE_ERROR;
-    }
-    let mut out = [0u8; 512];
-    let n = match apdu::pso_cds(&mut slot.pcsc, to_sign, &mut out) {
-        Ok(n) => n,
-        Err(_) => return CKR_FUNCTION_FAILED,
-    };
+    const SIGNATURE_LEN: usize = 256;
     if p_sig.is_null() {
         unsafe {
-            *pul_sig_len = n as CK_ULONG;
+            *pul_sig_len = SIGNATURE_LEN as CK_ULONG;
         }
         return CKR_OK;
     }
     unsafe {
-        if *pul_sig_len < n as CK_ULONG {
+        if *pul_sig_len < SIGNATURE_LEN as CK_ULONG {
+            *pul_sig_len = SIGNATURE_LEN as CK_ULONG;
             return CKR_BUFFER_TOO_SMALL;
         }
+    }
+    let slot = &mut state.slots[slot_id as usize];
+    let mut out = [0u8; 512];
+    let n = match apdu::hicos_v3_sign(&mut slot.pcsc, key_ref, to_sign, &mut out) {
+        Ok(n) => n,
+        Err(_) => return CKR_FUNCTION_FAILED,
+    };
+    unsafe {
         std::ptr::copy_nonoverlapping(out.as_ptr(), p_sig, n);
         *pul_sig_len = n as CK_ULONG;
     }
@@ -1114,7 +1149,11 @@ pub unsafe extern "C" fn c_sign(
     })
 }
 
-pub unsafe extern "C" fn c_sign_update(h: CK_SESSION_HANDLE, p_part: *mut CK_BYTE, ul_part_len: CK_ULONG) -> CK_RV {
+pub unsafe extern "C" fn c_sign_update(
+    h: CK_SESSION_HANDLE,
+    p_part: *mut CK_BYTE,
+    ul_part_len: CK_ULONG,
+) -> CK_RV {
     with_state(|state| {
         let Some(sess) = session_get_mut(state, h) else {
             return CKR_OPERATION_NOT_INITIALIZED;
@@ -1188,11 +1227,19 @@ pub unsafe extern "C" fn c_verify(
     not_supported!()
 }
 
-pub unsafe extern "C" fn c_verify_update(_h: CK_SESSION_HANDLE, _a: *mut CK_BYTE, _b: CK_ULONG) -> CK_RV {
+pub unsafe extern "C" fn c_verify_update(
+    _h: CK_SESSION_HANDLE,
+    _a: *mut CK_BYTE,
+    _b: CK_ULONG,
+) -> CK_RV {
     not_supported!()
 }
 
-pub unsafe extern "C" fn c_verify_final(_h: CK_SESSION_HANDLE, _a: *mut CK_BYTE, _b: CK_ULONG) -> CK_RV {
+pub unsafe extern "C" fn c_verify_final(
+    _h: CK_SESSION_HANDLE,
+    _a: *mut CK_BYTE,
+    _b: CK_ULONG,
+) -> CK_RV {
     not_supported!()
 }
 
@@ -1312,11 +1359,19 @@ pub unsafe extern "C" fn c_derive_key(
     not_supported!()
 }
 
-pub unsafe extern "C" fn c_seed_random(_h: CK_SESSION_HANDLE, _a: *mut CK_BYTE, _b: CK_ULONG) -> CK_RV {
+pub unsafe extern "C" fn c_seed_random(
+    _h: CK_SESSION_HANDLE,
+    _a: *mut CK_BYTE,
+    _b: CK_ULONG,
+) -> CK_RV {
     not_supported!()
 }
 
-pub unsafe extern "C" fn c_generate_random(_h: CK_SESSION_HANDLE, _a: *mut CK_BYTE, _b: CK_ULONG) -> CK_RV {
+pub unsafe extern "C" fn c_generate_random(
+    _h: CK_SESSION_HANDLE,
+    _a: *mut CK_BYTE,
+    _b: CK_ULONG,
+) -> CK_RV {
     not_supported!()
 }
 
@@ -1337,7 +1392,10 @@ pub unsafe extern "C" fn c_wait_for_slot_event(
 }
 
 pub static FUNCTION_LIST: CK_FUNCTION_LIST = CK_FUNCTION_LIST {
-    version: CK_VERSION { major: 2, minor: 40 },
+    version: CK_VERSION {
+        major: 2,
+        minor: 40,
+    },
     C_Initialize: c_initialize,
     C_Finalize: c_finalize,
     C_GetInfo: c_get_info,

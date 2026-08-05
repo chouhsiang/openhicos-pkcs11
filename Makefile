@@ -3,8 +3,6 @@
 #   make                  → build/openhicos-pkcs11-<os>-<arch>.so
 #   make release          → optimized build
 #   make test-load        → verify C_GetFunctionList loads
-#
-# Legacy C sources remain under pkcs11/ for reference; Rust is the default build.
 
 PREFIX  ?= /usr/local
 OUT     ?= build
@@ -63,7 +61,7 @@ else
   CARGO_LIB := $(CARGO_OUT)/libopenhicos_pkcs11.so
 endif
 
-.PHONY: all release clean install test-load legacy-c
+.PHONY: all release clean install test-load
 
 all: $(TARGET)
 
@@ -96,7 +94,3 @@ rv=lib.C_GetFunctionList(ctypes.byref(fl)); \
 print('C_GetFunctionList ->', rv, 'list=', hex(fl.value or 0)); \
 print('module:', '$(TARGET)'); \
 assert rv==0 and fl.value"
-
-# Build legacy C implementation (optional)
-legacy-c:
-	$(MAKE) -f Makefile.legacy

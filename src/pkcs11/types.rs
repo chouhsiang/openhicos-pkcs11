@@ -23,7 +23,7 @@ pub const CK_FALSE: CK_BBOOL = 0;
 
 pub const CKR_OK: CK_RV = 0x0000_0000;
 pub const CKR_ARGUMENTS_BAD: CK_RV = 0x0000_0007;
-pub const CKR_ATTRIBUTE_TYPE_INVALID: CK_RV = 0x0000_0013;
+pub const CKR_ATTRIBUTE_TYPE_INVALID: CK_RV = 0x0000_0012;
 pub const CKR_DATA_LEN_RANGE: CK_RV = 0x0000_0021;
 pub const CKR_DEVICE_ERROR: CK_RV = 0x0000_0030;
 pub const CKR_FUNCTION_FAILED: CK_RV = 0x0000_0006;
@@ -72,19 +72,36 @@ pub const CKA_CLASS: CK_ATTRIBUTE_TYPE = 0x0000_0000;
 pub const CKA_TOKEN: CK_ATTRIBUTE_TYPE = 0x0000_0001;
 pub const CKA_PRIVATE: CK_ATTRIBUTE_TYPE = 0x0000_0002;
 pub const CKA_LABEL: CK_ATTRIBUTE_TYPE = 0x0000_0003;
+pub const CKA_APPLICATION: CK_ATTRIBUTE_TYPE = 0x0000_0010;
 pub const CKA_VALUE: CK_ATTRIBUTE_TYPE = 0x0000_0011;
+pub const CKA_OBJECT_ID: CK_ATTRIBUTE_TYPE = 0x0000_0012;
 pub const CKA_CERTIFICATE_TYPE: CK_ATTRIBUTE_TYPE = 0x0000_0080;
+pub const CKA_ISSUER: CK_ATTRIBUTE_TYPE = 0x0000_0081;
+pub const CKA_SERIAL_NUMBER: CK_ATTRIBUTE_TYPE = 0x0000_0082;
 pub const CKA_KEY_TYPE: CK_ATTRIBUTE_TYPE = 0x0000_0100;
+pub const CKA_SUBJECT: CK_ATTRIBUTE_TYPE = 0x0000_0101;
 pub const CKA_ID: CK_ATTRIBUTE_TYPE = 0x0000_0102;
 pub const CKA_SENSITIVE: CK_ATTRIBUTE_TYPE = 0x0000_0103;
 pub const CKA_ENCRYPT: CK_ATTRIBUTE_TYPE = 0x0000_0104;
 pub const CKA_DECRYPT: CK_ATTRIBUTE_TYPE = 0x0000_0105;
+pub const CKA_WRAP: CK_ATTRIBUTE_TYPE = 0x0000_0106;
+pub const CKA_UNWRAP: CK_ATTRIBUTE_TYPE = 0x0000_0107;
 pub const CKA_SIGN: CK_ATTRIBUTE_TYPE = 0x0000_0108;
+pub const CKA_SIGN_RECOVER: CK_ATTRIBUTE_TYPE = 0x0000_0109;
 pub const CKA_VERIFY: CK_ATTRIBUTE_TYPE = 0x0000_010A;
+pub const CKA_VERIFY_RECOVER: CK_ATTRIBUTE_TYPE = 0x0000_010B;
+pub const CKA_DERIVE: CK_ATTRIBUTE_TYPE = 0x0000_010C;
 pub const CKA_MODULUS: CK_ATTRIBUTE_TYPE = 0x0000_0120;
 pub const CKA_MODULUS_BITS: CK_ATTRIBUTE_TYPE = 0x0000_0121;
 pub const CKA_PUBLIC_EXPONENT: CK_ATTRIBUTE_TYPE = 0x0000_0122;
+pub const CKA_EXTRACTABLE: CK_ATTRIBUTE_TYPE = 0x0000_0162;
+pub const CKA_LOCAL: CK_ATTRIBUTE_TYPE = 0x0000_0163;
+pub const CKA_NEVER_EXTRACTABLE: CK_ATTRIBUTE_TYPE = 0x0000_0164;
+pub const CKA_ALWAYS_SENSITIVE: CK_ATTRIBUTE_TYPE = 0x0000_0165;
+pub const CKA_MODIFIABLE: CK_ATTRIBUTE_TYPE = 0x0000_0170;
+pub const CKA_ALWAYS_AUTHENTICATE: CK_ATTRIBUTE_TYPE = 0x0000_0202;
 
+pub const CKO_DATA: CK_ULONG = 0x0000_0000;
 pub const CKO_CERTIFICATE: CK_ULONG = 0x0000_0001;
 pub const CKO_PUBLIC_KEY: CK_ULONG = 0x0000_0002;
 pub const CKO_PRIVATE_KEY: CK_ULONG = 0x0000_0003;
@@ -171,8 +188,7 @@ pub type CK_C_Initialize = unsafe extern "C" fn(*mut core::ffi::c_void) -> CK_RV
 pub type CK_C_Finalize = unsafe extern "C" fn(*mut core::ffi::c_void) -> CK_RV;
 pub type CK_C_GetInfo = unsafe extern "C" fn(*mut CK_INFO) -> CK_RV;
 pub type CK_C_GetFunctionList = unsafe extern "C" fn(*mut *const CK_FUNCTION_LIST) -> CK_RV;
-pub type CK_C_GetSlotList =
-    unsafe extern "C" fn(CK_BBOOL, *mut CK_SLOT_ID, *mut CK_ULONG) -> CK_RV;
+pub type CK_C_GetSlotList = unsafe extern "C" fn(CK_BBOOL, *mut CK_SLOT_ID, *mut CK_ULONG) -> CK_RV;
 pub type CK_C_GetSlotInfo = unsafe extern "C" fn(CK_SLOT_ID, *mut CK_SLOT_INFO) -> CK_RV;
 pub type CK_C_GetTokenInfo = unsafe extern "C" fn(CK_SLOT_ID, *mut CK_TOKEN_INFO) -> CK_RV;
 pub type CK_C_GetMechanismList =
@@ -181,7 +197,8 @@ pub type CK_C_GetMechanismInfo =
     unsafe extern "C" fn(CK_SLOT_ID, CK_MECHANISM_TYPE, *mut core::ffi::c_void) -> CK_RV;
 pub type CK_C_InitToken =
     unsafe extern "C" fn(CK_SLOT_ID, *mut CK_UTF8CHAR, CK_ULONG, *mut CK_UTF8CHAR) -> CK_RV;
-pub type CK_C_InitPIN = unsafe extern "C" fn(CK_SESSION_HANDLE, *mut CK_UTF8CHAR, CK_ULONG) -> CK_RV;
+pub type CK_C_InitPIN =
+    unsafe extern "C" fn(CK_SESSION_HANDLE, *mut CK_UTF8CHAR, CK_ULONG) -> CK_RV;
 pub type CK_C_SetPIN = unsafe extern "C" fn(
     CK_SESSION_HANDLE,
     *mut CK_UTF8CHAR,
@@ -198,7 +215,8 @@ pub type CK_C_OpenSession = unsafe extern "C" fn(
 ) -> CK_RV;
 pub type CK_C_CloseSession = unsafe extern "C" fn(CK_SESSION_HANDLE) -> CK_RV;
 pub type CK_C_CloseAllSessions = unsafe extern "C" fn(CK_SLOT_ID) -> CK_RV;
-pub type CK_C_GetSessionInfo = unsafe extern "C" fn(CK_SESSION_HANDLE, *mut CK_SESSION_INFO) -> CK_RV;
+pub type CK_C_GetSessionInfo =
+    unsafe extern "C" fn(CK_SESSION_HANDLE, *mut CK_SESSION_INFO) -> CK_RV;
 pub type CK_C_GetOperationState =
     unsafe extern "C" fn(CK_SESSION_HANDLE, *mut CK_BYTE, *mut CK_ULONG) -> CK_RV;
 pub type CK_C_SetOperationState = unsafe extern "C" fn(
@@ -276,8 +294,7 @@ pub type CK_C_DecryptUpdate = unsafe extern "C" fn(
 ) -> CK_RV;
 pub type CK_C_DecryptFinal =
     unsafe extern "C" fn(CK_SESSION_HANDLE, *mut CK_BYTE, *mut CK_ULONG) -> CK_RV;
-pub type CK_C_DigestInit =
-    unsafe extern "C" fn(CK_SESSION_HANDLE, *mut CK_MECHANISM) -> CK_RV;
+pub type CK_C_DigestInit = unsafe extern "C" fn(CK_SESSION_HANDLE, *mut CK_MECHANISM) -> CK_RV;
 pub type CK_C_Digest = unsafe extern "C" fn(
     CK_SESSION_HANDLE,
     *mut CK_BYTE,
@@ -299,8 +316,7 @@ pub type CK_C_Sign = unsafe extern "C" fn(
     *mut CK_BYTE,
     *mut CK_ULONG,
 ) -> CK_RV;
-pub type CK_C_SignUpdate =
-    unsafe extern "C" fn(CK_SESSION_HANDLE, *mut CK_BYTE, CK_ULONG) -> CK_RV;
+pub type CK_C_SignUpdate = unsafe extern "C" fn(CK_SESSION_HANDLE, *mut CK_BYTE, CK_ULONG) -> CK_RV;
 pub type CK_C_SignFinal =
     unsafe extern "C" fn(CK_SESSION_HANDLE, *mut CK_BYTE, *mut CK_ULONG) -> CK_RV;
 pub type CK_C_SignRecoverInit =
@@ -405,8 +421,7 @@ pub type CK_C_DeriveKey = unsafe extern "C" fn(
     CK_ULONG,
     *mut CK_OBJECT_HANDLE,
 ) -> CK_RV;
-pub type CK_C_SeedRandom =
-    unsafe extern "C" fn(CK_SESSION_HANDLE, *mut CK_BYTE, CK_ULONG) -> CK_RV;
+pub type CK_C_SeedRandom = unsafe extern "C" fn(CK_SESSION_HANDLE, *mut CK_BYTE, CK_ULONG) -> CK_RV;
 pub type CK_C_GenerateRandom =
     unsafe extern "C" fn(CK_SESSION_HANDLE, *mut CK_BYTE, CK_ULONG) -> CK_RV;
 pub type CK_C_GetFunctionStatus = unsafe extern "C" fn(CK_SESSION_HANDLE) -> CK_RV;
@@ -490,10 +505,6 @@ pub struct CK_FUNCTION_LIST {
 pub fn fill_blank(dst: &mut [CK_UTF8CHAR], src: &str) {
     let sl = src.len().min(dst.len());
     for (i, b) in dst.iter_mut().enumerate() {
-        *b = if i < sl {
-            src.as_bytes()[i]
-        } else {
-            b' '
-        };
+        *b = if i < sl { src.as_bytes()[i] } else { b' ' };
     }
 }
