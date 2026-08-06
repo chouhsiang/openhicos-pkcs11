@@ -99,6 +99,7 @@ impl Default for Session {
 
 struct Slot {
     present: bool,
+    logged_in: bool,
     reader: String,
     pcsc: PcscConn,
     token: Token,
@@ -157,6 +158,24 @@ fn session_get_mut(state: &mut State, h: CK_SESSION_HANDLE) -> Option<&mut Sessi
     }
 }
 
+fn session_state(flags: CK_FLAGS, logged_in: bool) -> CK_STATE {
+    match (flags & CKF_RW_SESSION != 0, logged_in) {
+        (true, true) => CKS_RW_USER_FUNCTIONS,
+        (true, false) => CKS_RW_PUBLIC_SESSION,
+        (false, true) => CKS_RO_USER_FUNCTIONS,
+        (false, false) => CKS_RO_PUBLIC_SESSION,
+    }
+}
+
+fn set_slot_sessions_login_state(sessions: &mut [Session], slot_id: CK_SLOT_ID, logged_in: bool) {
+    for session in sessions {
+        if session.in_use && session.slot == slot_id {
+            session.logged_in = logged_in;
+            session.state = session_state(session.flags, logged_in);
+        }
+    }
+}
+
 fn ensure_card(state: &mut State, slot_id: CK_SLOT_ID) -> CK_RV {
     if slot_id as usize >= state.slots.len() {
         return CKR_SLOT_ID_INVALID;
@@ -206,6 +225,13 @@ fn attr_match(o: &p15::TokenObject, tmpl: &[CK_ATTRIBUTE]) -> bool {
                     let slice =
                         std::slice::from_raw_parts(t.pValue as *const u8, t.ulValueLen as usize);
                     if slice.len() != o.label.len() || slice != o.label.as_bytes() {
+                        return false;
+                    }
+                }
+                CKA_VALUE if !t.pValue.is_null() => {
+                    let slice =
+                        std::slice::from_raw_parts(t.pValue as *const u8, t.ulValueLen as usize);
+                    if slice.len() != o.data.len() || slice != o.data.as_slice() {
                         return false;
                     }
                 }
@@ -492,6 +518,7 @@ pub unsafe extern "C" fn c_initialize(_p: *mut core::ffi::c_void) -> CK_RV {
             let pcsc = PcscConn::new().unwrap_or_else(|_| PcscConn::new().expect("PC/SC"));
             state.slots.push(Slot {
                 present: true,
+                logged_in: false,
                 reader,
                 pcsc,
                 token: Token::default(),
@@ -772,17 +799,15 @@ pub unsafe extern "C" fn c_open_session(
         if rv != CKR_OK {
             return rv;
         }
+        let logged_in = state.slots[slot_id as usize].logged_in;
         for (i, s) in state.sessions.iter_mut().enumerate() {
             if !s.in_use {
                 *s = Session {
                     in_use: true,
                     slot: slot_id,
                     flags,
-                    state: if flags & CKF_RW_SESSION != 0 {
-                        CKS_RW_PUBLIC_SESSION
-                    } else {
-                        CKS_RO_PUBLIC_SESSION
-                    },
+                    state: session_state(flags, logged_in),
+                    logged_in,
                     ..Default::default()
                 };
                 *ph_session = (i + 1) as CK_SESSION_HANDLE;
@@ -798,12 +823,20 @@ pub unsafe extern "C" fn c_close_session(h: CK_SESSION_HANDLE) -> CK_RV {
         if !state.initialized {
             return CKR_CRYPTOKI_NOT_INITIALIZED;
         }
-        if let Some(s) = session_get_mut(state, h) {
-            s.in_use = false;
-            CKR_OK
-        } else {
-            CKR_SESSION_HANDLE_INVALID
+        let Some(slot_id) = session_get(state, h).map(|s| s.slot) else {
+            return CKR_SESSION_HANDLE_INVALID;
+        };
+        session_get_mut(state, h).unwrap().in_use = false;
+        let remaining = state
+            .sessions
+            .iter()
+            .filter(|s| s.in_use && s.slot == slot_id)
+            .count();
+        if remaining == 0 {
+            state.slots[slot_id as usize].logged_in = false;
+            apdu::clear_auth_state();
         }
+        CKR_OK
     })
 }
 
@@ -812,11 +845,16 @@ pub unsafe extern "C" fn c_close_all_sessions(slot_id: CK_SLOT_ID) -> CK_RV {
         if !state.initialized {
             return CKR_CRYPTOKI_NOT_INITIALIZED;
         }
+        if slot_id as usize >= state.slots.len() {
+            return CKR_SLOT_ID_INVALID;
+        }
         for s in &mut state.sessions {
             if s.in_use && s.slot == slot_id {
                 s.in_use = false;
             }
         }
+        state.slots[slot_id as usize].logged_in = false;
+        apdu::clear_auth_state();
         CKR_OK
     })
 }
@@ -872,14 +910,14 @@ pub unsafe extern "C" fn c_login(
         if user_type != CKU_USER {
             return CKR_USER_TYPE_INVALID;
         }
-        if sess.logged_in {
+        let slot_id = sess.slot;
+        if state.slots[slot_id as usize].logged_in {
             return CKR_USER_ALREADY_LOGGED_IN;
         }
         if p_pin.is_null() || ul_pin_len == 0 {
             return CKR_ARGUMENTS_BAD;
         }
         let pin = std::slice::from_raw_parts(p_pin, ul_pin_len as usize);
-        let slot_id = sess.slot;
         let pin_ref = state.slots[slot_id as usize].token.pin_ref;
         let slot = &mut state.slots[slot_id as usize];
         match apdu::verify_pin(&mut slot.pcsc, pin_ref, pin) {
@@ -888,31 +926,23 @@ pub unsafe extern "C" fn c_login(
             PinResult::Incorrect => return CKR_PIN_INCORRECT,
             PinResult::Error => return CKR_DEVICE_ERROR,
         }
-        let sess = session_get_mut(state, h).unwrap();
-        sess.logged_in = true;
-        sess.state = if sess.flags & CKF_RW_SESSION != 0 {
-            CKS_RW_USER_FUNCTIONS
-        } else {
-            CKS_RO_USER_FUNCTIONS
-        };
+        state.slots[slot_id as usize].logged_in = true;
+        set_slot_sessions_login_state(&mut state.sessions, slot_id, true);
         CKR_OK
     })
 }
 
 pub unsafe extern "C" fn c_logout(h: CK_SESSION_HANDLE) -> CK_RV {
     with_state(|state| {
-        let Some(sess) = session_get_mut(state, h) else {
+        let Some(sess) = session_get(state, h) else {
             return CKR_SESSION_HANDLE_INVALID;
         };
-        if !sess.logged_in {
+        let slot_id = sess.slot;
+        if !state.slots[slot_id as usize].logged_in {
             return CKR_USER_NOT_LOGGED_IN;
         }
-        sess.logged_in = false;
-        sess.state = if sess.flags & CKF_RW_SESSION != 0 {
-            CKS_RW_PUBLIC_SESSION
-        } else {
-            CKS_RO_PUBLIC_SESSION
-        };
+        state.slots[slot_id as usize].logged_in = false;
+        set_slot_sessions_login_state(&mut state.sessions, slot_id, false);
         apdu::clear_auth_state();
         CKR_OK
     })
@@ -2451,6 +2481,68 @@ mod tests {
         assert_eq!(&em[em.len() - msg.len()..], msg);
         assert_eq!(em[em.len() - msg.len() - 1], 0x00);
         assert!(em[2..em.len() - msg.len() - 1].iter().all(|&b| b != 0));
+    }
+
+    #[test]
+    fn login_state_is_shared_by_all_sessions_on_a_slot() {
+        let mut sessions: [Session; 3] = std::array::from_fn(|_| Session::default());
+        sessions[0] = Session {
+            in_use: true,
+            slot: 0,
+            flags: CKF_SERIAL_SESSION,
+            ..Default::default()
+        };
+        sessions[1] = Session {
+            in_use: true,
+            slot: 0,
+            flags: CKF_SERIAL_SESSION | CKF_RW_SESSION,
+            ..Default::default()
+        };
+        sessions[2] = Session {
+            in_use: true,
+            slot: 1,
+            flags: CKF_SERIAL_SESSION,
+            ..Default::default()
+        };
+
+        set_slot_sessions_login_state(&mut sessions, 0, true);
+
+        assert!(sessions[0].logged_in);
+        assert_eq!(sessions[0].state, CKS_RO_USER_FUNCTIONS);
+        assert!(sessions[1].logged_in);
+        assert_eq!(sessions[1].state, CKS_RW_USER_FUNCTIONS);
+        assert!(!sessions[2].logged_in);
+        assert_eq!(sessions[2].state, CKS_RO_PUBLIC_SESSION);
+
+        set_slot_sessions_login_state(&mut sessions, 0, false);
+
+        assert!(!sessions[0].logged_in);
+        assert_eq!(sessions[0].state, CKS_RO_PUBLIC_SESSION);
+        assert!(!sessions[1].logged_in);
+        assert_eq!(sessions[1].state, CKS_RW_PUBLIC_SESSION);
+    }
+
+    #[test]
+    fn find_template_matches_certificate_value_exactly() {
+        let object = p15::TokenObject {
+            data: vec![0x30, 0x03, 0x01, 0x02, 0x03],
+            ..Default::default()
+        };
+        let mut matching_value: Vec<u8> = vec![0x30, 0x03, 0x01, 0x02, 0x03];
+        let matching_template = CK_ATTRIBUTE {
+            type_: CKA_VALUE,
+            pValue: matching_value.as_mut_ptr().cast(),
+            ulValueLen: matching_value.len() as CK_ULONG,
+        };
+        assert!(attr_match(&object, &[matching_template]));
+
+        let mut different_value: Vec<u8> = vec![0x30, 0x03, 0x01, 0x02, 0x04];
+        let different_template = CK_ATTRIBUTE {
+            type_: CKA_VALUE,
+            pValue: different_value.as_mut_ptr().cast(),
+            ulValueLen: different_value.len() as CK_ULONG,
+        };
+        assert!(!attr_match(&object, &[different_template]));
     }
 }
 
