@@ -938,7 +938,7 @@ mod tests {
         // Synthetic EF.0903 prefix (all-zero → twelve trailing digits).
         assert_eq!(
             gen2_model_from_serial_prefix(&[0, 0, 0, 0, 0, 0, 0, 0], true),
-            "T7S0000000000000000"
+            "T7S000000000000"
         );
     }
 }

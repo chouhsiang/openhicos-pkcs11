@@ -32,6 +32,56 @@
 
 ---
 
+## Rust API（給其他 crate 靜態連結）
+
+除 PKCS#11 `cdylib`（`C_GetFunctionList`，給 `pkcs11-tool`／dlopen）外，本 crate 同時提供 **`rlib` 高階 API**，可在 `Cargo.toml` 用 path／git 依賴，把邏輯靜態鏈進單一 binary，不必再打包 `.dylib`／`.so`／`.dll`。
+
+```toml
+# Cargo.toml
+open-gpki-pkcs11 = { git = "https://github.com/chouhsiang/open-gpki-pkcs11" }
+```
+
+```rust
+use open_gpki_pkcs11::api::{
+    self, DecryptPadding, DecryptRequest, SignMechanism, SignRequest,
+};
+
+fn main() -> Result<(), api::Error> {
+    let tokens = api::list_tokens()?;
+    println!("{} @ {}", tokens[0].serial, tokens[0].reader);
+
+    let certs = api::list_certificates(Some(tokens[0].slot_id))?;
+    // SIGN → label "cert1"；KEYX → "cert2"
+
+    let pin = std::env::var("GPKI_PIN").expect("set GPKI_PIN"); // 勿把 PIN 寫進原始碼
+    let signed = api::sign(SignRequest {
+        slot_id: Some(tokens[0].slot_id),
+        pin: &pin,
+        key_id: None, // 預設 b"SIGN"
+        mechanism: SignMechanism::Sha256RsaPkcs,
+        data: b"hello open-gpki",
+        return_certificate: true,
+    })?;
+    let _sig = signed.signature;
+    let _cert_der = signed.certificate_der;
+
+    let plain = api::decrypt(DecryptRequest {
+        slot_id: Some(tokens[0].slot_id),
+        pin: &pin,
+        key_id: None, // 預設 b"KEYX"
+        padding: DecryptPadding::RsaPkcs,
+        ciphertext: &[], // 填入 RSA 密文
+        return_certificate: false,
+    })?;
+    let _ = plain.plaintext;
+    Ok(())
+}
+```
+
+公開入口在 `open_gpki_pkcs11::api`：`list_tokens`、`list_certificates`、`sign`、`decrypt`；錯誤型別為 `api::Error`（可用 `match` 區分無卡／PIN／找不到金鑰等）。卡片操作有程序級 Mutex；`SignRequest`／`DecryptRequest` 的 `Debug` 不會印出 PIN。
+
+---
+
 ## 能做什麼
 
 ### 支援的 `pkcs11-tool` 操作
