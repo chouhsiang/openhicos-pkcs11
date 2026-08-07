@@ -1,8 +1,7 @@
 target/
 .DS_Store
-Cargo.lock
 
-# 預建 PKCS#11 模組（本機 make 產物）
+# 預建 PKCS#11 模組（本機 make 產物；正式檔請從 GitHub Releases 下載）
 build/
 
 # Gen2 Diverse 材料（本機 secrets/gen2_diverse.rs；僅提交 .example）

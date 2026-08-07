@@ -1,0 +1,190 @@
+# Build all five PKCS#11 modules and publish them to a GitHub Release.
+#
+# Triggers:
+#   - push of tags matching v* (e.g. v0.1.0)
+#   - workflow_dispatch (builds artifacts; creates a release only when run on a tag)
+#
+# Artifacts:
+#   open-gpki-pkcs11-macos-arm64.dylib
+#   open-gpki-pkcs11-macos-universal.dylib
+#   open-gpki-pkcs11-windows-x86_64.dll
+#   open-gpki-pkcs11-linux-x86_64.so
+#   open-gpki-pkcs11-linux-arm64.so
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macOS (arm64 + universal)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Build arm64 + x86_64 and lipo
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          cp target/aarch64-apple-darwin/release/libopen_gpki_pkcs11.dylib \
+            build/open-gpki-pkcs11-macos-arm64.dylib
+          lipo -create \
+            target/aarch64-apple-darwin/release/libopen_gpki_pkcs11.dylib \
+            target/x86_64-apple-darwin/release/libopen_gpki_pkcs11.dylib \
+            -output build/open-gpki-pkcs11-macos-universal.dylib
+          lipo -info build/open-gpki-pkcs11-macos-arm64.dylib
+          lipo -info build/open-gpki-pkcs11-macos-universal.dylib
+          ls -la build/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            build/open-gpki-pkcs11-macos-arm64.dylib
+            build/open-gpki-pkcs11-macos-universal.dylib
+          if-no-files-found: error
+
+  linux-x86_64:
+    name: Linux x86_64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PC/SC headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpcsclite-dev pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          cargo build --release
+          cp target/release/libopen_gpki_pkcs11.so build/open-gpki-pkcs11-linux-x86_64.so
+          ls -la build/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: build/open-gpki-pkcs11-linux-x86_64.so
+          if-no-files-found: error
+
+  linux-arm64:
+    name: Linux arm64
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PC/SC headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpcsclite-dev pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          cargo build --release
+          cp target/release/libopen_gpki_pkcs11.so build/open-gpki-pkcs11-linux-arm64.so
+          ls -la build/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64
+          path: build/open-gpki-pkcs11-linux-arm64.so
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          cargo build --release --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+          $src = "target\x86_64-pc-windows-msvc\release\open_gpki_pkcs11.dll"
+          if (-not (Test-Path $src)) {
+            $src = "target\release\open_gpki_pkcs11.dll"
+          }
+          Copy-Item -Force $src build\open-gpki-pkcs11-windows-x86_64.dll
+          Get-Item build\open-gpki-pkcs11-windows-x86_64.dll | Format-List FullName, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: build/open-gpki-pkcs11-windows-x86_64.dll
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: [macos, linux-x86_64, linux-arm64, windows]
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List release files
+        run: ls -la dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            Prebuilt PKCS#11 modules for **open-gpki-pkcs11** `${{ github.ref_name }}`.
+
+            | File | Platform |
+            |------|----------|
+            | `open-gpki-pkcs11-macos-arm64.dylib` | macOS Apple Silicon |
+            | `open-gpki-pkcs11-macos-universal.dylib` | macOS universal (x86_64 + arm64) |
+            | `open-gpki-pkcs11-windows-x86_64.dll` | Windows x86_64 |
+            | `open-gpki-pkcs11-linux-x86_64.so` | Linux x86_64 |
+            | `open-gpki-pkcs11-linux-arm64.so` | Linux arm64 |
+
+            Not government / official software.
+          files: |
+            dist/open-gpki-pkcs11-macos-arm64.dylib
+            dist/open-gpki-pkcs11-macos-universal.dylib
+            dist/open-gpki-pkcs11-windows-x86_64.dll
+            dist/open-gpki-pkcs11-linux-x86_64.so
+            dist/open-gpki-pkcs11-linux-arm64.so
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

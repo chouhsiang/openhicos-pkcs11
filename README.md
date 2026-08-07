@@ -14,7 +14,9 @@
 | **Windows** | ✓ | ✓ | `open-gpki-pkcs11-windows-x86_64.dll` |
 | **Linux** | ✓ | 尚未 | `open-gpki-pkcs11-linux-*.so` |
 
-### `build/` 預建產物（五個檔案）
+### 預建產物（五個檔案）
+
+正式發行檔請從 **[GitHub Releases](https://github.com/chouhsiang/open-gpki-pkcs11/releases)** 下載（打 `v*` tag 時由 GitHub Actions 自動編譯上傳）。本機 `make` 也會產出同名檔到 `build/`。
 
 | 檔案 | 說明 | 何時使用 |
 |------|------|----------|
