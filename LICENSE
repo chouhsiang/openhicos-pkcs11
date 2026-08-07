@@ -1,0 +1,7 @@
+GNU Lesser General Public License v2.1 or later
+
+See: https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html
+
+Disclaimer: This is an unofficial implementation based on ISO 7816 / PKCS#15
+and observed smart-card behavior. It is NOT affiliated with, endorsed by, or
+derived from any government proprietary middleware.

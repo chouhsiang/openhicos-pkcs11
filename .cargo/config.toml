@@ -1,0 +1,10 @@
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-fixup_chains"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-fixup_chains"]
+
+# Prefer rust-lld on windows-gnu (MinGW ld breaks on Unicode %USERPROFILE% paths).
+# Library search path for libwinscard.a is supplied by scripts/build-windows.ps1.
+[target.x86_64-pc-windows-gnu]
+linker = "rust-lld"

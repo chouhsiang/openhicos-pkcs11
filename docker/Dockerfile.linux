@@ -1,0 +1,21 @@
+# Build Linux PKCS#11 module (.so) with libpcsclite.
+# Usage:
+#   docker build --platform linux/arm64 -f docker/Dockerfile.linux \
+#     --output type=local,dest=build/out-linux-arm64 .
+#   docker build --platform linux/amd64 -f docker/Dockerfile.linux \
+#     --output type=local,dest=build/out-linux-amd64 .
+
+FROM rust:bookworm AS build
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libpcsclite-dev pkg-config \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY .cargo ./.cargo
+RUN cargo build --release \
+ && mkdir -p /out \
+ && cp target/release/libopen_gpki_pkcs11.so /out/open-gpki-pkcs11.so
+
+FROM scratch AS export
+COPY --from=build /out/open-gpki-pkcs11.so /
